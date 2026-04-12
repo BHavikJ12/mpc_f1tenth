@@ -1,0 +1,97 @@
+# MPCC Controller Parameters
+# Based on ETH Zurich paper: arXiv:1711.07300v1
+
+mpcc_controller:
+  ros__parameters:
+    # ============================================================================
+    # Controller Settings
+    # ============================================================================
+    
+    # Prediction horizon
+    horizon_length: 10                # Number of prediction steps (N)
+    dt: 0.05                          # Timestep in seconds (50ms = 20Hz)
+    
+    # Control loop frequency
+    control_frequency: 20.0           # Hz
+    
+    
+    # ============================================================================
+    # Cost Function Weights (Equation 11, Page 11)
+    # ============================================================================
+    
+    # Contouring error penalty (perpendicular to track)
+    q_contour: 10.0                   # q_c in paper
+    
+    # Lag error penalty (along track direction)
+    q_lag: 100.0                      # q_l in paper
+    
+    # Progress reward (encourages forward motion)
+    gamma: 1.0                        # γ in paper (negative cost for velocity)
+    
+    # Input regularization
+    r_steering: 0.1                   # Steering input smoothness
+    r_accel: 0.1                      # Acceleration input smoothness
+    
+    # Track boundary slack penalty
+    q_slack: 1000.0                   # Very high to avoid track violations
+    
+    
+    # ============================================================================
+    # Vehicle Model Parameters (Section II-A, Pages 4-5)
+    # ============================================================================
+    
+    # Kinematic bicycle model
+    wheelbase: 0.33                   # L: distance between axles (meters)
+    
+    # Vehicle constraints
+    max_steering: 0.4                 # Maximum steering angle (radians) ≈ 23°
+    max_acceleration: 3.0             # Maximum acceleration (m/s²)
+    max_velocity: 8.0                 # Maximum velocity (m/s)
+    min_velocity: 0.0                 # Minimum velocity (m/s)
+    
+    
+    # ============================================================================
+    # Track Parameters
+    # ============================================================================
+    
+    # Track geometry
+    track_width: 1.0                  # Track width (meters)
+    
+    # Waypoint file (can be overridden by launch argument)
+    waypoints_file: "waypoints.csv"
+    
+    
+    # ============================================================================
+    # QP Solver Settings (OSQP)
+    # ============================================================================
+    
+    solver:
+      max_iter: 4000                  # Maximum solver iterations
+      eps_abs: 1.0e-4                 # Absolute tolerance
+      eps_rel: 1.0e-4                 # Relative tolerance
+      verbose: false                  # Print solver output
+      warm_start: true                # Use previous solution as initial guess
+    
+    
+    # ============================================================================
+    # Visualization
+    # ============================================================================
+    
+    visualize: true                   # Publish visualization markers
+    viz_predicted_path: true          # Show predicted trajectory
+    viz_reference_path: true          # Show reference centerline
+    viz_track_boundaries: true        # Show track boundaries
+    viz_errors: true                  # Show contouring/lag errors
+    
+    
+    # ============================================================================
+    # Safety
+    # ============================================================================
+    
+    # Timeout for odometry messages
+    odom_timeout: 0.5                 # seconds
+    
+    # Emergency stop conditions
+    enable_emergency_stop: true
+    max_contouring_error: 0.5         # meters (stop if exceeded)
+    max_lag_error: 2.0                # meters (stop if exceeded)
