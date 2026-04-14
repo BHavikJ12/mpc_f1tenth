@@ -28,6 +28,7 @@ from std_msgs.msg import ColorRGBA
 from mpcc_controller.track_map import TrackMap
 from mpcc_controller.vehicle_model import VehicleModel
 from mpcc_controller.mpcc_controller import MPCCController
+from mpcc_controller.mpcc_logger import MPCCLogger
 
 
 class MPCCNode(Node):
@@ -68,9 +69,13 @@ class MPCCNode(Node):
         self.get_logger().info(f'Loading waypoints from: {waypoints_file}')
         waypoints = self._load_waypoints(waypoints_file)
         self.get_logger().info(f'Loaded {len(waypoints)} waypoints')
-        
+        print(f"First waypoint: {waypoints[0]}")
+        print(f"Waypoint range X: [{waypoints[:,0].min():.3f}, {waypoints[:,0].max():.3f}]")
+        print(f"Waypoint range Y: [{waypoints[:,1].min():.3f}, {waypoints[:,1].max():.3f}]")
+                
         # Initialize track and vehicle
         self.track = TrackMap(waypoints, track_width)
+        print(f"🔍 TRACK LENGTH = {self.track.L:.3f} meters")  # ADD THIS!
         self.vehicle = VehicleModel(wheelbase)
         
         # Initialize MPCC controller
@@ -123,6 +128,24 @@ class MPCCNode(Node):
         self.get_logger().info('MPCC Controller initialized')
         self.get_logger().info(f'Control frequency: {self.control_freq} Hz')
         self.get_logger().info(f'Horizon: {N} steps, dt: {dt}s')
+
+        self.create_timer(0.1, self._check_shutdown)
+
+        log_dir = pathlib.Path.home() / 'mpcc_logs'  # Or any directory you prefer
+        self.logger = MPCCLogger(log_dir=str(log_dir), enable=True)
+        self.get_logger().info(f'CSV Logger initialized: {log_dir}')
+
+    def _check_shutdown(self):
+        """Periodic check for shutdown - ensures logger cleanup"""
+        # This will be called periodically, no action needed
+        # The logger's atexit handler will clean up automatically
+        pass
+    
+    def destroy_node(self):
+        """Override destroy to ensure logger cleanup"""
+        if hasattr(self, 'logger'):
+            self.logger.close()
+        super().destroy_node()
     
     def _load_waypoints(self, filepath):
         """Load waypoints from CSV file"""
@@ -140,14 +163,13 @@ class MPCCNode(Node):
                 x = float(row['x_m'])
                 y = float(row['y_m'])
                 waypoints.append([x, y])
-        
+
+        waypoints = list(reversed(waypoints))
         return np.array(waypoints)
     
 
     def pose_callback(self, msg):
         """Process AMCL pose message"""
-        print("Received pose message")
-
         X = msg.pose.pose.position.x
         Y = msg.pose.pose.position.y
         
@@ -184,37 +206,105 @@ class MPCCNode(Node):
             f'φ={np.rad2deg(self.state[2]):.1f}°, v={self.state[3]:.2f}m/s',
             throttle_duration_sec=1.0
         )
-        self.theta = self.track.project_point(X, Y)
-        X_ref, Y_ref, _ = self.track.get_reference(self.theta)
-        dist = np.sqrt((X - X_ref)**2 + (Y - Y_ref)**2)
-        self.get_logger().info(f'Distance to centerline: {dist:.2f}m')
+        
         # Initialize theta on first message
         if not self.initialized:
             self.initialized = True
-            # drive_msg = AckermannDriveStamped()
-            # drive_msg.drive.steering_angle = 0.0
-            # drive_msg.drive.speed = 0.2
-            # self.drive_pub.publish(drive_msg)
+            self.theta = self.track.project_point(X, Y)
             self.get_logger().info(f'Initialized at θ={self.theta:.2f}m, pose=({X:.2f}, {Y:.2f})')
 
         
     
     def control_loop(self):
         """Main control loop (called at control_frequency)"""   
-    
-        if not self.initialized:
-            return
-        
-        if self.state is None:
-            return
+        if not self.initialized or self.state is None:
+            return      
         
         try:
+            timestamp = self.get_clock().now().nanoseconds / 1e9
+
+            X, Y, phi, v = self.state
+            X_ref, Y_ref, Phi_ref = self.track.get_reference(self.theta)
+            e_c_now, e_l_now = self.track.compute_errors(X, Y, self.theta)
+
+
+            print(f"\n{'='*70}")
+            print(f"MPCC TICK  t={timestamp:.3f}s")
+            print(f"{'='*70}")
+            print(f"[INPUT TO SOLVER]")
+            print(f"  State x0:")
+            print(f"    X   = {X:+.4f} m")
+            print(f"    Y   = {Y:+.4f} m")
+            print(f"    phi = {np.rad2deg(phi):+.2f} deg")
+            print(f"    v   = {v:+.4f} m/s")
+            print(f"  Progress theta0 = {self.theta:.4f} m  (L = {self.track.L:.2f} m)")
+            print(f"  Reference at theta0:")
+            print(f"    X_ref   = {X_ref:+.4f} m")
+            print(f"    Y_ref   = {Y_ref:+.4f} m")
+            print(f"    Phi_ref = {np.rad2deg(Phi_ref):+.2f} deg")
+            print(f"  Errors at current state:")
+            print(f"    e_c (contouring) = {e_c_now:+.4f} m")
+            print(f"    e_l (lag)        = {e_l_now:+.4f} m")
+            print(f"    distance to ref  = {np.hypot(X-X_ref, Y-Y_ref):.4f} m")
+
+            
             # Solve MPCC
             u_opt, x_pred, theta_pred = self.controller.solve(self.state, self.theta)
-            
+
+            v_virtual_pred = getattr(self.controller, 'v_virtual_prev', None)
+        
+            # Log iteration to CSV
+            self.logger.log_iteration(
+                timestamp=timestamp,
+                state=self.state,
+                theta=self.theta,
+                u_opt=u_opt,
+                x_pred=x_pred,
+                theta_pred=theta_pred,
+                solver_result=self.controller.last_result,
+                track=self.track,
+                controller=self.controller,
+                v_virtual_pred=v_virtual_pred
+            )
+                
             # Extract control
             delta = float(u_opt[0])  # Steering
             a = float(u_opt[1])      # Acceleration
+
+            print(f"[SOLVER OUTPUT]")
+            if hasattr(self.controller, 'last_result') and self.controller.last_result is not None:
+                info = self.controller.last_result.info
+                print(f"  Status:      {info.status}")
+                print(f"  Iterations:  {info.iter}")
+                print(f"  Solve time:  {info.solve_time*1000:.2f} ms")
+                print(f"  Objective:   {info.obj_val:.4f}")
+            print(f"  Control u[0]:")
+            print(f"    delta = {np.rad2deg(delta):+.2f} deg  "
+                  f"({delta:+.4f} rad)")
+            print(f"    a     = {a:+.3f} m/s^2")
+            if v_virtual_pred is not None and len(v_virtual_pred) > 0:
+                print(f"  Virtual velocity v_virt[0] = {v_virtual_pred[0]:+.4f} m/s")
+                print(f"  Virtual velocity trajectory: "
+                      f"min={v_virtual_pred.min():+.3f}, "
+                      f"max={v_virtual_pred.max():+.3f}, "
+                      f"mean={v_virtual_pred.mean():+.3f} m/s")
+
+            # ============================================================
+            # PREDICTED TRAJECTORY (first 3 steps of horizon)
+            # ============================================================
+            print(f"[PREDICTED TRAJECTORY]")
+            n_show = min(3, len(x_pred))
+            for k in range(n_show):
+                print(f"  Step {k+1}: "
+                      f"X={x_pred[k,0]:+.4f}, "
+                      f"Y={x_pred[k,1]:+.4f}, "
+                      f"phi={np.rad2deg(x_pred[k,2]):+.2f}deg, "
+                      f"v={x_pred[k,3]:+.4f}m/s, "
+                      f"theta={theta_pred[k]:.4f}m")
+            print(f"  Horizon progress: "
+                  f"delta_theta = {theta_pred[-1]-self.theta:+.4f} m "
+                  f"over {len(theta_pred)} steps")
+            print(f"{'='*70}\n")
             
             # Convert acceleration to target velocity
             v_current = self.state[3]
@@ -233,8 +323,20 @@ class MPCCNode(Node):
             self.drive_pub.publish(drive_msg)
             
             # Update theta for next iteration (use prediction)
-            if len(theta_pred) > 0:
-                self.theta_predicted = theta_pred
+            # In pose_callback(), CHANGE line 243 to:
+            theta_predicted = float(theta_pred[0])
+
+            # Secondary source: projection of current pose, used only as
+            # a drift correction with a small gain.
+            theta_measured = self.track.project_point(self.state[0], self.state[1])
+
+            # Wrap-aware error: shortest signed distance on the circular
+            # track, in the range (-L/2, +L/2].
+            L = self.track.L
+            theta_error = (theta_measured - theta_predicted + L / 2.0) % L - L / 2.0
+
+            correction_gain = 0.05
+            self.theta = (theta_predicted + correction_gain * theta_error) % L
             
             # Compute errors for logging
             e_c, e_l = self.track.compute_errors(
@@ -290,6 +392,11 @@ class MPCCNode(Node):
         
         self.ref_path_pub.publish(ref_path)
 
+    def __del__(self):
+        """Destructor - close logger on shutdown"""
+        if hasattr(self, 'logger'):
+            self.logger.close()
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -308,6 +415,9 @@ def main(args=None):
         import traceback
         traceback.print_exc()
     finally:
+        print("🛑 Cleaning up...")
+        if hasattr(node, 'logger'):
+            node.logger.close()
         print("🛑 Shutting down...")
         executor.shutdown()
         node.destroy_node()

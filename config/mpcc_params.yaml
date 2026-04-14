@@ -26,7 +26,7 @@ mpcc_controller:
     q_lag: 100.0                      # q_l in paper
     
     # Progress reward (encourages forward motion)
-    gamma: 1.0                        # γ in paper (negative cost for velocity)
+    gamma: 50.0                        # γ in paper (negative cost for velocity)
     
     # Input regularization
     r_steering: 0.1                   # Steering input smoothness

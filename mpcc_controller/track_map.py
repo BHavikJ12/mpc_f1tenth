@@ -45,13 +45,13 @@ class TrackMap:
         points = np.array(splev(u_fine, self.tck)).T
         
         # Compute arc-length: s = ∫√(dx² + dy²) du
-        dx = np.gradient(points[:, 0])
-        dy = np.gradient(points[:, 1])
-        ds = np.sqrt(dx**2 + dy**2)
-        
-        # Cumulative arc-length
+        dx_du = np.gradient(points[:, 0], u_fine)  # ← ADD u_fine parameter!
+        dy_du = np.gradient(points[:, 1], u_fine)  # ← ADD u_fine parameter!
+        ds = np.sqrt(dx_du**2 + dy_du**2)
+
+        # Cumulative arc-length using trapezoidal integration
         s_cumsum = np.insert(cumulative_trapezoid(ds, u_fine), 0, 0)
-        self.L = s_cumsum[-1]  # Total track length
+        self.L = s_cumsum[-1]
         
         # Create mapping: θ (meters) → u (spline parameter)
         from scipy.interpolate import interp1d
@@ -99,18 +99,19 @@ class TrackMap:
         """
         # STAGE 1: Coarse global search
         # Sample every ~1 meter along entire track
-        n_samples = max(100, int(self.L / 1.0))  # ~337 samples for 337m track
-        theta_samples = np.linspace(0, self.L, n_samples)
-        
-        distances_sq = []
-        for theta in theta_samples:
-            X_ref, Y_ref, _ = self.get_reference(theta)
-            dist_sq = (X - X_ref)**2 + (Y - Y_ref)**2
-            distances_sq.append(dist_sq)
-        
-        # Find coarse minimum (globally!)
-        min_idx = np.argmin(distances_sq)
-        theta_coarse = theta_samples[min_idx]
+        n_samples = max(500, int(self.L / 0.2))  # ~1700 samples for 337m track
+        theta_samples = np.linspace(0, self.L, n_samples, endpoint=False)
+
+        # Vectorized evaluation of all reference points at once.
+        u_samples = self.theta_to_u(theta_samples)
+        pts = np.array(splev(u_samples, self.tck, der=0))  # shape (2, n_samples)
+        X_refs = pts[0]
+        Y_refs = pts[1]
+        distances_sq = (X - X_refs) ** 2 + (Y - Y_refs) ** 2
+
+        # Find coarse minimum (globally)
+        min_idx = int(np.argmin(distances_sq))
+        theta_coarse = float(theta_samples[min_idx])
         # Result: θ ≈ 280m
         
         # STAGE 2: Fine local refinement
@@ -128,8 +129,6 @@ class TrackMap:
                               bounds=(theta_min, theta_max),
                               method='bounded')
         theta_refined = np.mod(result.x, self.L)
-
-        print(f"Projection optimization success: {theta_refined}m")
         
         return theta_refined
         
@@ -163,48 +162,49 @@ class TrackMap:
         e_l = -np.cos(Phi) * dx - np.sin(Phi) * dy
         
         return e_c, e_l
-    
+
     def get_halfspace_constraints(self, theta):
         """
         Get track boundary constraints as halfspace inequalities
         
-        Reference: Equation 14e (Page 12)
-        Format: F · [X, Y]' ≤ f
+        The constraint is: stay within ±half_w perpendicular to centerline
+        
+        Format: F · [X, Y]' - s ≤ f
+        Where s is slack variable
         
         Args:
             theta: Arc-length progress
             
         Returns:
-            (F, f): Constraint matrices where F·[X,Y]' ≤ f
+            (F, f): Constraint matrices where F·[X,Y]' - s ≤ f
         """
         # Get reference point and heading
         X_ref, Y_ref, Phi = self.get_reference(theta)
         
-        # Normal vector (perpendicular to track)
+        # Normal vector (perpendicular to track, pointing LEFT)
         n_x = -np.sin(Phi)
         n_y = np.cos(Phi)
         
         # Half track width
         half_w = self.track_width / 2.0
         
-        # Left and right boundary points
-        left_x = X_ref + half_w * n_x
-        left_y = Y_ref + half_w * n_y
+        # The signed distance from centerline is:
+        # d = n_x·(X - X_ref) + n_y·(Y - Y_ref)
+        #
+        # We want: -half_w ≤ d ≤ half_w
+        #
+        # Rearranging:
+        #   d ≤ half_w  →  n_x·X + n_y·Y ≤ half_w + n_x·X_ref + n_y·Y_ref
+        #  -d ≤ half_w  → -n_x·X - n_y·Y ≤ half_w - n_x·X_ref - n_y·Y_ref
         
-        right_x = X_ref - half_w * n_x
-        right_y = Y_ref - half_w * n_y
-        
-        # Constraint matrices
-        # Constraint 1: n_x·X + n_y·Y ≤ n_x·left_x + n_y·left_y (left boundary)
-        # Constraint 2: -n_x·X - n_y·Y ≤ -n_x·right_x - n_y·right_y (right boundary)
         F = np.array([
-            [n_x, n_y],
-            [-n_x, -n_y]
+            [n_x, n_y],      # Left boundary
+            [-n_x, -n_y]     # Right boundary
         ])
         
         f = np.array([
-            n_x * left_x + n_y * left_y,
-            -n_x * right_x - n_y * right_y
+            half_w + n_x * X_ref + n_y * Y_ref,    # Left: d ≤ +half_w
+            half_w - n_x * X_ref - n_y * Y_ref     # Right: -d ≤ +half_w
         ])
         
         return F, f

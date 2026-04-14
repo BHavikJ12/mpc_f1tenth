@@ -48,9 +48,10 @@ class MPCCController:
         # Cost weights (tunable parameters - Equation 14a)
         self.q_c = 10.0       # Contouring error penalty
         self.q_l = 100.0      # Lag error penalty
-        self.gamma = 1.0      # Progress reward
+        self.gamma = 50.0      # Progress reward
         self.R_u = 0.1        # Input regularization
         self.q_slack = 1000.0 # Track boundary slack penalty
+        print(f"MPCC Cost weights: q_c={self.q_c}, q_l={self.q_l}, gamma={self.gamma}, R_u={self.R_u}, q_slack={self.q_slack}")
         
         # Constraints (Equation 14g-14h)
         self.delta_max = 0.4    # Maximum steering (rad)
@@ -85,7 +86,7 @@ class MPCCController:
             # FIX: Use current velocity for progress guess
             v_current = max(x0[3], 1.0)  # At least 1 m/s
             theta_guess = theta0 + np.cumsum(np.ones(self.N) * v_current * self.dt)
-            theta_guess = np.mod(theta_guess, self.track.L)  # Wrap around
+            # theta_guess = np.mod(theta_guess, self.track.L)  # Wrap around
         else:
             # Shift previous solution (real-time iteration)
             x_guess = np.vstack([self.x_prev[1:], self.x_prev[-1]])
@@ -127,18 +128,281 @@ class MPCCController:
         
         # Solve QP
         result = self.solver.solve()
+        # if result.info.status == 'solved' or result.info.status == 'solved inaccurate':
+        #     print(f"\n{'='*70}")
+        #     print(f"QP SOLUTION DIAGNOSTIC")
+        #     print(f"{'='*70}")
+        #     print(f"Solver status: {result.info.status}")
+        #     print(f"Iterations: {result.info.iter}")
+        #     print(f"Solve time: {result.info.solve_time*1000:.2f}ms")
+            
+        #     # Extract solution components
+        #     x_start = 0
+        #     u_start = self.N * 4
+        #     theta_start = self.N * 6
+        #     v_start = self.N * 7
+        #     s_start = self.N * 8
+            
+        #     x_sol = result.x[x_start:u_start].reshape(self.N, 4)
+        #     u_sol = result.x[u_start:theta_start].reshape(self.N, 2)
+        #     theta_sol = result.x[theta_start:v_start]
+        #     v_virtual_sol = result.x[v_start:s_start]
+        #     s_sol = result.x[s_start:].reshape(self.N, 2)
+            
+        #     # ========================================================================
+        #     # 1. DECISION VARIABLES
+        #     # ========================================================================
+        #     print(f"\n1. DECISION VARIABLES (first 3 steps)")
+        #     print(f"{'-'*70}")
+        #     for k in range(min(3, self.N)):
+        #         print(f"Step {k}:")
+        #         print(f"  State x[{k}]:  X={x_sol[k,0]:.4f}, Y={x_sol[k,1]:.4f}, "
+        #             f"φ={np.rad2deg(x_sol[k,2]):6.2f}°, v={x_sol[k,3]:.4f}m/s")
+        #         print(f"  Input u[{k}]:  δ={np.rad2deg(u_sol[k,0]):6.2f}°, "
+        #             f"a={u_sol[k,1]:6.3f}m/s²")
+        #         print(f"  Progress θ[{k}]: {theta_sol[k]:.4f}m, "
+        #             f"v_virtual={v_virtual_sol[k]:.4f}m/s")
+        #         print(f"  Slack s[{k}]:   left={s_sol[k,0]:.4f}m, right={s_sol[k,1]:.4f}m")
+            
+        #     print(f"\nSummary over horizon:")
+        #     print(f"  Virtual velocity: min={v_virtual_sol.min():.3f}, "
+        #         f"max={v_virtual_sol.max():.3f}, mean={v_virtual_sol.mean():.3f}m/s")
+        #     print(f"  State velocity:   min={x_sol[:,3].min():.3f}, "
+        #         f"max={x_sol[:,3].max():.3f}, mean={x_sol[:,3].mean():.3f}m/s")
+        #     print(f"  Steering:         min={np.rad2deg(u_sol[:,0].min()):.1f}°, "
+        #         f"max={np.rad2deg(u_sol[:,0].max()):.1f}°, mean={np.rad2deg(u_sol[:,0].mean()):.1f}°")
+        #     print(f"  Acceleration:     min={u_sol[:,1].min():.2f}, "
+        #         f"max={u_sol[:,1].max():.2f}, mean={u_sol[:,1].mean():.2f}m/s²")
+        #     print(f"  Progress:         Δθ={theta_sol[-1]-theta_sol[0]:.3f}m "
+        #         f"(from {theta_sol[0]:.3f} to {theta_sol[-1]:.3f})")
+            
+        #     # ========================================================================
+        #     # 2. COST BREAKDOWN
+        #     # ========================================================================
+        #     print(f"\n2. COST BREAKDOWN")
+        #     print(f"{'-'*70}")
+            
+        #     # Compute individual cost components
+        #     cost_contouring_total = 0.0
+        #     cost_lag_total = 0.0
+        #     cost_progress_total = 0.0
+        #     cost_input_total = 0.0
+        #     cost_slack_total = 0.0
+            
+        #     print(f"\nPer-step costs (first 3 steps):")
+        #     for k in range(min(3, self.N)):
+        #         # Get reference
+        #         X_ref, Y_ref, Phi = self.track.get_reference(theta_sol[k])
+                
+        #         # Compute errors
+        #         e_c = np.sin(Phi) * (x_sol[k,0] - X_ref) - np.cos(Phi) * (x_sol[k,1] - Y_ref)
+        #         e_l = -np.cos(Phi) * (x_sol[k,0] - X_ref) - np.sin(Phi) * (x_sol[k,1] - Y_ref)
+                
+        #         # Individual costs
+        #         cost_c = self.q_c * e_c**2
+        #         cost_l = self.q_l * e_l**2
+        #         cost_p = -self.gamma * v_virtual_sol[k] * self.dt
+        #         cost_u = self.R_u * (u_sol[k,0]**2 + u_sol[k,1]**2)
+        #         cost_s = self.q_slack * (s_sol[k,0]**2 + s_sol[k,1]**2)
+                
+        #         print(f"  k={k}: e_c={e_c:7.4f}m, e_l={e_l:7.4f}m")
+        #         print(f"       Contouring: {cost_c:8.4f}  (q_c={self.q_c} × e_c²)")
+        #         print(f"       Lag:        {cost_l:8.4f}  (q_l={self.q_l} × e_l²)")
+        #         print(f"       Progress:   {cost_p:8.4f}  (-γ={self.gamma} × v_virt × dt)")
+        #         print(f"       Input:      {cost_u:8.4f}  (R={self.R_u} × (δ²+a²))")
+        #         print(f"       Slack:      {cost_s:8.4f}  (q_slack={self.q_slack} × (s_L²+s_R²))")
+        #         print(f"       Step total: {cost_c + cost_l + cost_p + cost_u + cost_s:8.4f}")
+                
+        #         cost_contouring_total += cost_c
+        #         cost_lag_total += cost_l
+        #         cost_progress_total += cost_p
+        #         cost_input_total += cost_u
+        #         cost_slack_total += cost_s
+            
+        #     # Sum over remaining steps
+        #     for k in range(3, self.N):
+        #         X_ref, Y_ref, Phi = self.track.get_reference(theta_sol[k])
+        #         e_c = np.sin(Phi) * (x_sol[k,0] - X_ref) - np.cos(Phi) * (x_sol[k,1] - Y_ref)
+        #         e_l = -np.cos(Phi) * (x_sol[k,0] - X_ref) - np.sin(Phi) * (x_sol[k,1] - Y_ref)
+                
+        #         cost_contouring_total += self.q_c * e_c**2
+        #         cost_lag_total += self.q_l * e_l**2
+        #         cost_progress_total += -self.gamma * v_virtual_sol[k] * self.dt
+        #         cost_input_total += self.R_u * (u_sol[k,0]**2 + u_sol[k,1]**2)
+        #         cost_slack_total += self.q_slack * (s_sol[k,0]**2 + s_sol[k,1]**2)
+            
+        #     cost_computed = (cost_contouring_total + cost_lag_total + cost_progress_total + 
+        #                     cost_input_total + cost_slack_total)
+            
+        #     print(f"\nTotal costs over horizon:")
+        #     print(f"  Contouring error:  {cost_contouring_total:10.4f}  ({cost_contouring_total/cost_computed*100:5.1f}%)")
+        #     print(f"  Lag error:         {cost_lag_total:10.4f}  ({cost_lag_total/cost_computed*100:5.1f}%)")
+        #     print(f"  Progress reward:   {cost_progress_total:10.4f}  ({cost_progress_total/cost_computed*100:5.1f}%)")
+        #     print(f"  Input penalty:     {cost_input_total:10.4f}  ({cost_input_total/cost_computed*100:5.1f}%)")
+        #     print(f"  Slack penalty:     {cost_slack_total:10.4f}  ({cost_slack_total/cost_computed*100:5.1f}%)")
+        #     print(f"  {'─'*70}")
+        #     print(f"  Computed total:    {cost_computed:10.4f}")
+        #     print(f"  OSQP objective:    {result.info.obj_val:10.4f}")
+        #     print(f"  Match: {'✓' if np.abs(cost_computed - result.info.obj_val) < 0.01 else '✗ MISMATCH!'}")
+            
+        #     # ========================================================================
+        #     # 3. CONSTRAINT SATISFACTION
+        #     # ========================================================================
+        #     print(f"\n3. CONSTRAINT SATISFACTION")
+        #     print(f"{'-'*70}")
+            
+        #     # Input bounds
+        #     delta_violations = np.sum(np.abs(u_sol[:,0]) > self.delta_max)
+        #     a_violations = np.sum(np.abs(u_sol[:,1]) > self.a_max)
+        #     print(f"Input bounds:")
+        #     print(f"  Steering: max_used={np.rad2deg(np.abs(u_sol[:,0]).max()):.2f}°, "
+        #         f"limit={np.rad2deg(self.delta_max):.2f}°, violations={delta_violations}")
+        #     print(f"  Accel:    max_used={np.abs(u_sol[:,1]).max():.3f}m/s², "
+        #         f"limit={self.a_max:.3f}m/s², violations={a_violations}")
+            
+        #     # Velocity bounds
+        #     v_violations = np.sum((x_sol[:,3] < 0) | (x_sol[:,3] > self.v_max))
+        #     print(f"\nVelocity bounds:")
+        #     print(f"  State v: min={x_sol[:,3].min():.3f}, max={x_sol[:,3].max():.3f}m/s, "
+        #         f"limit=[0, {self.v_max}], violations={v_violations}")
+        #     print(f"  Virtual v: min={v_virtual_sol.min():.3f}, max={v_virtual_sol.max():.3f}m/s, "
+        #         f"limit=[0, {self.v_max}], violations={np.sum((v_virtual_sol < 0) | (v_virtual_sol > self.v_max))}")
+            
+        #     # Progress bounds
+        #     theta_violations = np.sum((theta_sol < 0) | (theta_sol > 2 * self.track.L))
+        #     print(f"\nProgress bounds:")
+        #     print(f"  θ: min={theta_sol.min():.3f}, max={theta_sol.max():.3f}m, "
+        #         f"limit=[0, {self.track.L:.1f}], violations={theta_violations}")
+            
+        #     # Slack non-negativity
+        #     slack_violations = np.sum(s_sol < 0)
+        #     print(f"\nSlack non-negativity:")
+        #     print(f"  min(s)={s_sol.min():.6f}, violations={slack_violations}")
+            
+        #     # Track boundaries
+        #     print(f"\nTrack boundary violations:")
+        #     for k in range(min(3, self.N)):
+        #         F, f = self.track.get_halfspace_constraints(theta_sol[k])
+        #         X, Y = x_sol[k,0], x_sol[k,1]
+                
+        #         # Check: F·[X,Y] - s ≤ f
+        #         for i in range(2):
+        #             lhs = F[i,0] * X + F[i,1] * Y - s_sol[k,i]
+        #             rhs = f[i]
+        #             violated = lhs > rhs + 1e-6
+                    
+        #             bound_name = "left" if i == 0 else "right"
+        #             print(f"  k={k}, {bound_name}: F·[X,Y]-s={lhs:.4f}, limit={rhs:.4f}, "
+        #                 f"violation={max(0, lhs-rhs):.4f} {'✗' if violated else '✓'}")
+            
+        #     # ========================================================================
+        #     # 4. DYNAMICS CONSISTENCY
+        #     # ========================================================================
+        #     print(f"\n4. DYNAMICS CONSISTENCY CHECK")
+        #     print(f"{'-'*70}")
+            
+        #     print(f"Vehicle dynamics (first 2 steps):")
+        #     for k in range(min(2, self.N)):
+        #         if k == 0:
+        #             x_curr = x0
+        #         else:
+        #             x_curr = x_sol[k-1]
+                
+        #         # Forward propagate using dynamics
+        #         A, B, g = self.vehicle.linearize(x_curr, u_sol[k])
+        #         Ad, Bd, gd = self.vehicle.discretize(A, B, g, self.dt)
+        #         x_pred = Ad @ x_curr + Bd @ u_sol[k] + gd
+        #         x_actual = x_sol[k]
+                
+        #         error = np.linalg.norm(x_pred - x_actual)
+        #         print(f"  k={k}: predicted={x_pred}, actual={x_actual}")
+        #         print(f"       error={error:.6f} {'✓' if error < 1e-3 else '✗ MISMATCH!'}")
+            
+        #     print(f"\nProgress dynamics:")
+        #     for k in range(min(3, self.N)):
+        #         if k == 0:
+        #             theta_curr = theta0
+        #         else:
+        #             theta_curr = theta_sol[k-1]
+                
+        #         theta_pred = theta_curr + v_virtual_sol[k] * self.dt
+        #         theta_actual = theta_sol[k]
+        #         error = abs(theta_pred - theta_actual)
+                
+        #         print(f"  k={k}: θ_pred={theta_pred:.4f}, θ_actual={theta_actual:.4f}, "
+        #             f"error={error:.6f} {'✓' if error < 1e-4 else '✗'}")
+            
+        #     # ========================================================================
+        #     # 5. DIAGNOSIS
+        #     # ========================================================================
+        #     print(f"\n5. DIAGNOSIS")
+        #     print(f"{'-'*70}")
+            
+        #     # Check what's dominant in cost
+        #     costs = {
+        #         'Contouring': cost_contouring_total,
+        #         'Lag': cost_lag_total,
+        #         'Progress': abs(cost_progress_total),
+        #         'Input': cost_input_total,
+        #         'Slack': cost_slack_total
+        #     }
+        #     dominant_cost = max(costs, key=costs.get)
+            
+        #     print(f"Dominant cost term: {dominant_cost} ({costs[dominant_cost]:.2f})")
+            
+        #     # Check if optimizer is trying to move
+        #     if v_virtual_sol.mean() < 0.1:
+        #         print(f"⚠️  Virtual velocity near ZERO → optimizer not trying to make progress!")
+        #         print(f"    → Progress reward too weak OR constraints blocking motion")
+        #     elif v_virtual_sol.mean() > 1.0:
+        #         print(f"✓  Virtual velocity good ({v_virtual_sol.mean():.2f}m/s) → optimizer wants progress")
+            
+        #     # Check if controls are saturated
+        #     if np.abs(u_sol[:,0]).max() > 0.95 * self.delta_max:
+        #         print(f"⚠️  Steering SATURATED at {np.rad2deg(np.abs(u_sol[:,0]).max()):.1f}°")
+        #         print(f"    → Track boundaries forcing hard turns OR contouring weight too high")
+            
+        #     if np.abs(u_sol[:,1]).max() > 0.95 * self.a_max:
+        #         accel_sign = "BRAKING" if u_sol[0,1] < 0 else "ACCELERATING"
+        #         print(f"⚠️  Acceleration SATURATED at {u_sol[0,1]:.2f}m/s² ({accel_sign})")
+        #         if u_sol[0,1] < 0:
+        #             print(f"    → Optimizer wants to SLOW DOWN!")
+        #             print(f"    → Check: Is moving actually reducing cost?")
+            
+        #     # Check slack usage
+        #     if s_sol.max() > 0.01:
+        #         print(f"⚠️  Slack variables active (max={s_sol.max():.3f}m)")
+        #         print(f"    → Track boundaries being violated → may be too tight")
+            
+        #     print(f"{'='*70}\n")
         
-        if result.info.status != 'solved':
-            print(f"⚠️  OSQP status: {result.info.status}")
-        
-        # Extract solution
+        # else:
+        #     print(f"❌ QP FAILED: {result.info.status}")
+        #     print(f"{'='*70}\n")
+
+        self.last_result = result
+
         z_opt = result.x
         x_opt, u_opt, theta_opt = self._unpack_solution(z_opt)
+
+        v_start = self.N * 7
+        v_opt = z_opt[v_start:v_start + self.N]
+        self.v_virtual_prev = v_opt  # Store for logging
+        
+        # === ADD THIS: Extract virtual velocity for logging ===
+        v_start = self.N * 7
+        v_opt = z_opt[v_start:v_start + self.N]
+        self.v_virtual_prev = v_opt  # Store for logger
         
         # Store for warm start
         self.x_prev = x_opt
         self.u_prev = u_opt
         self.theta_prev = theta_opt
+        
+        if result.info.status != 'solved':
+            print(f"⚠️  OSQP status: {result.info.status}")
+        
+
         
         # Return first control
         return u_opt[0], x_opt, theta_opt
@@ -470,7 +734,7 @@ class MPCCController:
         n_track_bounds = self.N * 2      # Track boundary constraints
         
         n_constraints = (n_input_bounds + n_state_v_bounds + 
-                        n_virtual_v_bounds + n_theta_bounds + n_slack_bounds + n_track_bounds)
+                        n_virtual_v_bounds + n_theta_bounds + n_slack_bounds + n_track_bounds + self.N)
         
         rows = []
         cols = []
@@ -551,7 +815,7 @@ class MPCCController:
             cols.append(theta_idx)
             data.append(1.0)
             l_ineq.append(0.0)
-            u_ineq.append(self.track.L)
+            u_ineq.append(2.0 * self.track.L)
             constraint_idx += 1
         
         # ================================================================
@@ -602,7 +866,29 @@ class MPCCController:
                 l_ineq.append(-np.inf)
                 u_ineq.append(f[i])
                 constraint_idx += 1
-        
+
+        # ================================================================
+        # 6. VELOCITY COUPLING: v_virtual ≤ v_state
+        # ================================================================
+        # Virtual progress cannot exceed actual car velocity
+
+        for k in range(self.N):
+            v_virtual_idx = v_start + k
+            v_state_idx = x_start + k * 4 + 3  # v is 4th element of x_k
+            
+            # Constraint: v_virtual - v_state ≤ 0
+            rows.append(constraint_idx)
+            cols.append(v_virtual_idx)
+            data.append(1.0)
+            
+            rows.append(constraint_idx)
+            cols.append(v_state_idx)
+            data.append(-1.0)
+            
+            l_ineq.append(-np.inf)
+            u_ineq.append(0.0)
+            constraint_idx += 1
+                
         # Build sparse matrix
         A_ineq = sparse.csc_matrix((data, (rows, cols)), shape=(n_constraints, n_vars))
         l_ineq = np.array(l_ineq)
