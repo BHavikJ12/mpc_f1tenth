@@ -20,13 +20,13 @@ mpcc_controller:
     # ============================================================================
     
     # Contouring error penalty (perpendicular to track)
-    q_contour: 10.0                   # q_c in paper
+    q_contour: 50.0                   # q_c in paper
     
     # Lag error penalty (along track direction)
-    q_lag: 100.0                      # q_l in paper
+    q_lag: 50.0                      # q_l in paper
     
     # Progress reward (encourages forward motion)
-    gamma: 50.0                        # γ in paper (negative cost for velocity)
+    gamma: 25.0                        # γ in paper (negative cost for velocity)
     
     # Input regularization
     r_steering: 0.1                   # Steering input smoothness

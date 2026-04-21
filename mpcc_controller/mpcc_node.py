@@ -30,12 +30,19 @@ from mpcc_controller.vehicle_model import VehicleModel
 from mpcc_controller.mpcc_controller import MPCCController
 from mpcc_controller.mpcc_logger import MPCCLogger
 
-
 class MPCCNode(Node):
     """ROS2 node for MPCC control"""
     
     def __init__(self):
         super().__init__('mpcc_controller')
+
+        # Pose snapshot (from AMCL)
+        self._X = None
+        self._Y = None
+        self._phi = None
+
+        # Velocity snapshot (from odom — body-frame longitudinal)
+        self.v_odom = 0.0
         
         # Declare parameters
         self.declare_parameter('waypoints_file', 'waypoints.csv')
@@ -43,13 +50,13 @@ class MPCCNode(Node):
         self.declare_parameter('dt', 0.05)
         self.declare_parameter('wheelbase', 0.33)
         self.declare_parameter('track_width', 1.0)
-        self.declare_parameter('control_frequency', 20.0)
+        self.declare_parameter('control_frequency', 10.0)
         self.declare_parameter('visualize', True)
         
         # Cost weights
-        self.declare_parameter('q_contour', 10.0)
-        self.declare_parameter('q_lag', 100.0)
-        self.declare_parameter('gamma', 50.0)
+        self.declare_parameter('q_contour', 50.0)
+        self.declare_parameter('q_lag', 50.0)
+        self.declare_parameter('gamma', 25.0)
         
         # Vehicle constraints
         self.declare_parameter('max_steering', 0.4)
@@ -110,6 +117,13 @@ class MPCCNode(Node):
             self.pose_callback,         # Renamed callback
             qos
         )
+
+        self.ego_odom_sub = self.create_subscription(
+            Odometry,
+            '/ego_racecar/odom',
+            self.odom_callback,
+            qos
+        )
         
         # Publishers
         self.drive_pub = self.create_publisher(
@@ -167,58 +181,66 @@ class MPCCNode(Node):
         waypoints = list(reversed(waypoints))
         return np.array(waypoints)
     
+    def odom_callback(self, msg):
+        """Process /ego_racecar/odom for ground-truth body-frame velocity.
+        
+        twist.linear.x is the F1TENTH simulator's integrated longitudinal
+        velocity — no differentiation, no filtering needed.
+        """
+        self.v_odom = msg.twist.twist.linear.x
+    
 
     def pose_callback(self, msg):
-        """Process AMCL pose message"""
+        """Process AMCL pose. Runs at ~33 Hz.
+        
+        Provides X, Y, φ only. Velocity comes from /ego_racecar/odom.
+        """
         X = msg.pose.pose.position.x
         Y = msg.pose.pose.position.y
         
-        # Extract heading from quaternion (same as before)
+        # Extract heading from quaternion
         qx = msg.pose.pose.orientation.x
         qy = msg.pose.pose.orientation.y
         qz = msg.pose.pose.orientation.z
         qw = msg.pose.pose.orientation.w
-        
-        # Convert to yaw
         siny_cosp = 2.0 * (qw * qz + qx * qy)
         cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
         phi = np.arctan2(siny_cosp, cosy_cosp)
-        
-        if self.state is not None:
-            # Use previous velocity or estimate from position change
-            dt = 0.05  # Control timestep
-            if hasattr(self, 'last_position'):
-                dx = X - self.last_position[0]
-                dy = Y - self.last_position[1]
-                v = np.sqrt(dx**2 + dy**2) / dt
-            else:
-                v = 0.0
-        else:
-            v = 0.0
-        
-        # Store for next iteration
-        self.last_position = (X, Y)
-        
-        # Update state
-        self.state = np.array([X, Y, phi, v])
-        self.get_logger().info(
-            f'State: X={self.state[0]:.2f}, Y={self.state[1]:.2f}, '
-            f'φ={np.rad2deg(self.state[2]):.1f}°, v={self.state[3]:.2f}m/s',
-            throttle_duration_sec=1.0
-        )
-        
-        # Initialize theta on first message
+
         if not self.initialized:
             self.initialized = True
             self.theta = self.track.project_point(X, Y)
-            self.get_logger().info(f'Initialized at θ={self.theta:.2f}m, pose=({X:.2f}, {Y:.2f})')
-
+            self.get_logger().info(
+                f'Initialized at θ={self.theta:.2f}m, pose=({X:.2f}, {Y:.2f})'
+            )
+        
+            
+            # Store snapshot for control_loop (NOTE: do NOT write self.state here)
+            self._X = X
+            self._Y = Y
+            self._phi = phi
+            
+            # Initialize theta on first valid message
+            if not self.initialized:
+                self.initialized = True
+                self.theta = self.track.project_point(X, Y)
+                self.get_logger().info(
+                    f'Initialized at θ={self.theta:.2f}m, pose=({X:.2f}, {Y:.2f})'
+                )
+        
+        # Store snapshot for control_loop
+        self._X = X
+        self._Y = Y
+        self._phi = phi
+        
         
     
     def control_loop(self):
         """Main control loop (called at control_frequency)"""   
-        if not self.initialized or self.state is None:
-            return      
+        if not self.initialized or self._X is None:
+            return
+    
+        self.state = np.array([self._X, self._Y, self._phi, self.v_odom])
         
         try:
             timestamp = self.get_clock().now().nanoseconds / 1e9
@@ -292,19 +314,19 @@ class MPCCNode(Node):
             # ============================================================
             # PREDICTED TRAJECTORY (first 3 steps of horizon)
             # ============================================================
-            print(f"[PREDICTED TRAJECTORY]")
-            n_show = min(3, len(x_pred))
-            for k in range(n_show):
-                print(f"  Step {k+1}: "
-                      f"X={x_pred[k,0]:+.4f}, "
-                      f"Y={x_pred[k,1]:+.4f}, "
-                      f"phi={np.rad2deg(x_pred[k,2]):+.2f}deg, "
-                      f"v={x_pred[k,3]:+.4f}m/s, "
-                      f"theta={theta_pred[k]:.4f}m")
-            print(f"  Horizon progress: "
-                  f"delta_theta = {theta_pred[-1]-self.theta:+.4f} m "
-                  f"over {len(theta_pred)} steps")
-            print(f"{'='*70}\n")
+            # print(f"[PREDICTED TRAJECTORY]")
+            # n_show = min(3, len(x_pred))
+            # for k in range(n_show):
+            #     print(f"  Step {k+1}: "
+            #           f"X={x_pred[k,0]:+.4f}, "
+            #           f"Y={x_pred[k,1]:+.4f}, "
+            #           f"phi={np.rad2deg(x_pred[k,2]):+.2f}deg, "
+            #           f"v={x_pred[k,3]:+.4f}m/s, "
+            #           f"theta={theta_pred[k]:.4f}m")
+            # print(f"  Horizon progress: "
+            #       f"delta_theta = {theta_pred[-1]-self.theta:+.4f} m "
+            #       f"over {len(theta_pred)} steps")
+            # print(f"{'='*70}\n")
             
             # Convert acceleration to target velocity
             v_current = self.state[3]
@@ -335,8 +357,9 @@ class MPCCNode(Node):
             L = self.track.L
             theta_error = (theta_measured - theta_predicted + L / 2.0) % L - L / 2.0
 
-            correction_gain = 0.05
-            self.theta = (theta_predicted + correction_gain * theta_error) % L
+            # correction_gain = 0.05
+            # self.theta = (theta_predicted + correction_gain * theta_error) % L
+            self.theta = self.track.project_point(self.state[0], self.state[1])
             
             # Compute errors for logging
             e_c, e_l = self.track.compute_errors(
@@ -344,12 +367,12 @@ class MPCCNode(Node):
             )
             
             # Log
-            self.get_logger().info(
-                f'θ={self.theta:.2f}m, v={v_current:.2f}m/s, '
-                f'δ={np.rad2deg(delta):.1f}°, a={a:.2f}m/s², '
-                f'e_c={e_c:.3f}m, e_l={e_l:.3f}m',
-                throttle_duration_sec=1.0
-            )
+            # self.get_logger().info(
+            #     f'θ={self.theta:.2f}m, v={v_current:.2f}m/s, '
+            #     f'δ={np.rad2deg(delta):.1f}°, a={a:.2f}m/s², '
+            #     f'e_c={e_c:.3f}m, e_l={e_l:.3f}m',
+            #     throttle_duration_sec=1.0
+            # )
             
             # Visualization
             if self.visualize:
