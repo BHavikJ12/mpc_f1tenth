@@ -46,12 +46,14 @@ class MPCCController:
         self.dt = dt
         
         # Cost weights (tunable parameters - Equation 14a)
-        self.q_c = 50.0       # Contouring error penalty
-        self.q_l = 50.0      # Lag error penalty
-        self.gamma = 50.0      # Progress reward
+        self.q_c = 10.0       # Contouring error penalty
+        self.q_l = 100.0      # Lag error penalty
+        self.q_theta = 500.0  # Heading error penalty (NEW: align car with track tangent)
+        self.gamma = 100.0     # Progress reward
         self.R_u = 0.1        # Input regularization
-        self.q_slack = 1000.0 # Track boundary slack penalty
-        print(f"MPCC Cost weights: q_c={self.q_c}, q_l={self.q_l}, gamma={self.gamma}, R_u={self.R_u}, q_slack={self.q_slack}")
+        self.q_slack = 100.0 # Track boundary slack penalty
+        # print(f"MPCC Cost weights: q_c={self.q_c}, q_l={self.q_l}, q_theta={self.q_theta}, "
+        #       f"gamma={self.gamma}, R_u={self.R_u}, q_slack={self.q_slack}")
         
         # Constraints (Equation 14g-14h)
         self.delta_max = 0.4    # Maximum steering (rad)
@@ -62,7 +64,6 @@ class MPCCController:
         self.x_prev = None
         self.u_prev = None
         self.theta_prev = None
-        self.v_virtual_prev = None
         
         # Setup OSQP solver
         self.solver = osqp.OSQP()
@@ -80,35 +81,19 @@ class MPCCController:
             (u_opt, x_pred, theta_pred): Optimal first control, predicted states, predicted progress
         """
         # Warm start: guess trajectory
-        # Warm start: guess trajectory
         if self.x_prev is None:
-            # First call — no previous solution available
             x_guess = np.tile(x0, (self.N, 1))
             u_guess = np.zeros((self.N, 2))
-            v_current = x0[3]   # use actual velocity (no floor)
+            
+            # FIX: Use current velocity for progress guess
+            v_current = max(x0[3], 1.0)  # At least 1 m/s
             theta_guess = theta0 + np.cumsum(np.ones(self.N) * v_current * self.dt)
+            # theta_guess = np.mod(theta_guess, self.track.L)  # Wrap around
         else:
-            # If car is essentially stationary, reset warm start to flat
-            if x0[3] < 0.1:  # m/s threshold
-                x_guess = np.tile(x0, (self.N, 1))
-                u_guess = np.zeros((self.N, 2))
-                theta_guess = np.full(self.N, theta0)
-            else:
-                # Shift previous solution (real-time iteration)
-                x_guess = np.vstack([self.x_prev[1:], self.x_prev[-1]])
-                u_guess = np.vstack([self.u_prev[1:], self.u_prev[-1]])
-                theta_guess = np.append(
-                    self.theta_prev[1:],
-                    self.theta_prev[-1] + x0[3] * self.dt
-                )
-
-        print(f"[THETA_GUESS] theta0={theta0:.4f}")
-        print(f"  theta_guess spread: min={theta_guess.min():.4f}, max={theta_guess.max():.4f}")
-        print(f"  theta_guess[0:3]: {theta_guess[0]:.4f}, {theta_guess[1]:.4f}, {theta_guess[2]:.4f}")
-        print(f"  theta_guess advance over horizon: {theta_guess[-1] - theta_guess[0]:.4f}m")
-        if self.v_virtual_prev is not None:
-            v = self.v_virtual_prev
-            print(f"  v_virtual_prev: min={v.min():.4f}, max={v.max():.4f}, mean={v.mean():.4f}")
+            # Shift previous solution (real-time iteration)
+            x_guess = np.vstack([self.x_prev[1:], self.x_prev[-1]])
+            u_guess = np.vstack([self.u_prev[1:], self.u_prev[-1]])
+            theta_guess = np.append(self.theta_prev[1:], self.theta_prev[-1] + 0.1)
         
         # Linearize dynamics at each step (Section III-B4)
         A_list, B_list, g_list = [], [], []
@@ -122,7 +107,7 @@ class MPCCController:
             g_list.append(gd)
         
         # Build cost matrices (Equation 14a)
-        H, q = self._build_cost_matrices(theta_guess)
+        H, q = self._build_cost_matrices(theta_guess, x_guess)
         
         # Build dynamics constraints (Equation 14c, 14d)
         A_eq, l_eq, u_eq = self._build_dynamics_constraints(A_list, B_list, g_list, x0, theta0)
@@ -203,81 +188,24 @@ class MPCCController:
             print(f"  Expected OSQP obj:         {cost_expected_osqp:+10.4f}")
             print(f"  Actual OSQP obj:           {cost_actual_osqp:+10.4f}")
             print(f"  Mismatch (should be ≈0):   {mismatch:+10.4f}")
-            print(f"  Status: {'✓ PASS' if abs(mismatch) < 1.0 else '✗ FAIL'}")
+            print("\n[CONSTRAINT DEBUG]")
+
+            print(f"  slack max       = {np.max(s_sol):.5f}")
+            print(f"  slack mean      = {np.mean(s_sol):.5f}")
+
+            # print(f"  dual norm       = {np.linalg.norm(y):.4f}")
             print(f"{'─'*60}\n")
+
+            print("\n[LINEARIZATION CHECK]")
+
+            print(f"  first predicted steering = {np.rad2deg(u_sol[0,0]):.2f} deg")
+            print(f"  first predicted velocity = {x_sol[0,3]:.3f}")
 
         self.last_result = result
 
         z_opt = result.x
         x_opt, u_opt, theta_opt = self._unpack_solution(z_opt)
-
-        # ============================================================
-        # COST BREAKDOWN DIAGNOSTIC
-        # ============================================================
-        v_start = self.N * 7
-        s_start = self.N * 8
-        v_opt = z_opt[v_start:v_start + self.N]
-        s_opt = z_opt[s_start:s_start + self.N * 2].reshape(self.N, 2)
-
-        # Compute each cost component using the SAME theta_guess that OSQP used
-        # (so numbers match what the solver actually optimized)
-        cost_contouring = 0.0
-        cost_lag = 0.0
-        cost_progress = 0.0
-        cost_input = 0.0
-        cost_slack = 0.0
-
-        for k in range(self.N):
-            # Reference from theta_GUESS (what H, q were built with)
-            theta_k = theta_guess[k]
-            X_ref, Y_ref, Phi = self.track.get_reference(theta_k)
-            s_phi = np.sin(Phi)
-            c_phi = np.cos(Phi)
-            
-            # Errors at solution state using linearization-point reference
-            X_k = x_opt[k, 0]
-            Y_k = x_opt[k, 1]
-            e_c_k = s_phi * (X_k - X_ref) - c_phi * (Y_k - Y_ref)
-            e_l_k = -c_phi * (X_k - X_ref) - s_phi * (Y_k - Y_ref)
-            
-            # Component costs
-            cost_contouring += self.q_c * e_c_k**2
-            cost_lag       += self.q_l * e_l_k**2
-            cost_progress  += -self.gamma * v_opt[k] * self.dt
-            cost_input     += self.R_u * (u_opt[k, 0]**2 + u_opt[k, 1]**2)
-            cost_slack     += self.q_slack * (s_opt[k, 0]**2 + s_opt[k, 1]**2)
-
-        cost_total = cost_contouring + cost_lag + cost_progress + cost_input + cost_slack
-
-        print("\n────────────────────────────────────────────────────────────")
-        print("COST BREAKDOWN (per horizon, using solution values)")
-        print("────────────────────────────────────────────────────────────")
-        print(f"  Contouring (q_c·Σe_c²):       {cost_contouring:+10.4f}")
-        print(f"  Lag        (q_l·Σe_l²):       {cost_lag:+10.4f}")
-        print(f"  Progress   (-γ·Σv_virt·dt):   {cost_progress:+10.4f}")
-        print(f"  Input      (R_u·Σu²):         {cost_input:+10.4f}")
-        print(f"  Slack      (q_slack·Σs²):     {cost_slack:+10.4f}")
-        print(f"  ─────────────────────────────────────")
-        print(f"  Total (non-const):            {cost_total:+10.4f}")
-        print(f"  OSQP obj:                     {result.info.obj_val:+10.4f}")
-
-        # Identify dominant term
-        abs_costs = {
-            'Contouring': abs(cost_contouring),
-            'Lag':        abs(cost_lag),
-            'Progress':   abs(cost_progress),
-            'Input':      abs(cost_input),
-            'Slack':      abs(cost_slack),
-        }
-        dominant = max(abs_costs, key=abs_costs.get)
-        print(f"  Dominant term: {dominant} ({abs_costs[dominant]:.2f})")
-
-        # Marginal analysis: what would cost be if a=3 (max) instead?
-        # Quick estimate of acceleration trade-off
-        print(f"\n  Solver chose: a={u_opt[0,1]:+.3f}, δ={np.rad2deg(u_opt[0,0]):+.2f}°")
-        print(f"  Applied cost weights: q_c={self.q_c}, q_l={self.q_l}, γ={self.gamma}, R_u={self.R_u}")
-        print("────────────────────────────────────────────────────────────\n")
-        # ============================================================
+        print(f"Optimal first control: δ={u_opt[0,0]:.4f} rad, a={u_opt[0,1]:.4f} m/s²")
 
         v_start = self.N * 7
         v_opt = z_opt[v_start:v_start + self.N]
@@ -295,22 +223,27 @@ class MPCCController:
         
         if result.info.status != 'solved':
             print(f"⚠️  OSQP status: {result.info.status}")
-        
 
-        
+
         # Return first control
         return u_opt[0], x_opt, theta_opt
     
-    def _build_cost_matrices(self, theta_guess):
+    def _build_cost_matrices(self, theta_guess, x_guess):
         """
         Build quadratic cost matrices H and q (Equation 14a)
         
         Cost function:
-            Σ [||ê_c||²_{q_c} + ||ê_l||²_{q_l} + ||Δu||²_R - γ·v·dt] + slack penalty
+            Σ [||ê_c||²_{q_c} + ||ê_l||²_{q_l} + q_θ·(φ-Φ_ref)² + ||Δu||²_R - γ·v·dt] + slack penalty
         
         Where:
             ê_c: Linearized contouring error (Equation 11a)
             ê_l: Linearized lag error (Equation 11b)
+            φ-Φ_ref: Heading error (linearized; angle-wrapped via x_guess)
+        
+        Args:
+            theta_guess: Predicted progress at each horizon step (N,)
+            x_guess: Predicted state at each horizon step (N, 4) — used to wrap
+                     the heading reference into the right branch around current φ
         
         Returns:
             H: Quadratic cost matrix (sparse, n_vars × n_vars)
@@ -424,6 +357,43 @@ class MPCCController:
             # Linear terms q[X], q[Y]
             q[x_idx] += g_c_X + g_l_X
             q[x_idx + 1] += g_c_Y + g_l_Y
+            
+            # ================================================================
+            # HEADING ERROR COST: q_θ·(φ - Φ_ref)²    (NEW)
+            # ================================================================
+            # Aligns car's heading with track tangent direction.
+            # Critical for kinematic bicycle: without this, δ is "spent" only
+            # on chasing X,Y position instead of pointing along the path.
+            #
+            # Wrapping: φ_guess and raw Φ_ref may differ by 2π·n.
+            # Compute wrapped error around current guess, then build an
+            # "effective" Φ_ref within ±π of φ_guess so the linear cost
+            # (φ - Φ_ref_eff)² is well-posed.
+            #
+            # Quadratic expansion:
+            #   q_θ·(φ - Φ_eff)² = q_θ·φ² - 2·q_θ·Φ_eff·φ + const
+            #
+            # OSQP doubling convention (factor of 2 because cost is 0.5·z'Hz):
+            #   H[φ, φ] += 2·q_θ
+            #   q[φ]    += -2·q_θ·Φ_eff
+            
+            phi_guess = x_guess[k, 2]  # heading guess for this horizon step
+            
+            # Wrap the heading error to (-π, π] around the current guess
+            wrapped_err = np.arctan2(
+                np.sin(phi_guess - Phi),
+                np.cos(phi_guess - Phi)
+            )
+            # "Effective" reference: the unwrapped angle nearest to phi_guess
+            Phi_ref_eff = phi_guess - wrapped_err
+            
+            # H[φ, φ] += 2·q_θ
+            H_data.append(2.0 * self.q_theta)
+            H_row.append(x_idx + 2)        # φ is index 2 of state
+            H_col.append(x_idx + 2)
+            
+            # q[φ] += -2·q_θ·Φ_ref_eff
+            q[x_idx + 2] += -2.0 * self.q_theta * Phi_ref_eff
             
             # ================================================================
             # INPUT REGULARIZATION: ||Δu||²_R (Equation 14a)

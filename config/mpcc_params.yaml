@@ -26,14 +26,14 @@ mpcc_controller:
     q_lag: 50.0                      # q_l in paper
     
     # Progress reward (encourages forward motion)
-    gamma: 25.0                        # γ in paper (negative cost for velocity)
+    gamma: 100.0                        # γ in paper (negative cost for velocity)
     
     # Input regularization
     r_steering: 0.1                   # Steering input smoothness
     r_accel: 0.1                      # Acceleration input smoothness
     
     # Track boundary slack penalty
-    q_slack: 1000.0                   # Very high to avoid track violations
+    q_slack: 100.0                   # Very high to avoid track violations
     
     
     # ============================================================================
@@ -44,7 +44,7 @@ mpcc_controller:
     wheelbase: 0.33                   # L: distance between axles (meters)
     
     # Vehicle constraints
-    max_steering: 0.4                 # Maximum steering angle (radians) ≈ 23°
+    max_steering: 1                 # Maximum steering angle (radians) ≈ 23°
     max_acceleration: 3.0             # Maximum acceleration (m/s²)
     max_velocity: 8.0                 # Maximum velocity (m/s)
     min_velocity: 0.0                 # Minimum velocity (m/s)

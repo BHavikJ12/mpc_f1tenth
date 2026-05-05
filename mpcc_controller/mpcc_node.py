@@ -56,10 +56,10 @@ class MPCCNode(Node):
         # Cost weights
         self.declare_parameter('q_contour', 50.0)
         self.declare_parameter('q_lag', 50.0)
-        self.declare_parameter('gamma', 25.0)
+        self.declare_parameter('gamma', 100.0)
         
         # Vehicle constraints
-        self.declare_parameter('max_steering', 0.4)
+        self.declare_parameter('max_steering', np.deg2rad(60.0))  # 30 degrees in radians
         self.declare_parameter('max_acceleration', 3.0)
         self.declare_parameter('max_velocity', 8.0)
         
@@ -111,12 +111,12 @@ class MPCCNode(Node):
         )
         
         # Subscribers
-        self.odom_sub = self.create_subscription(
-            PoseWithCovarianceStamped,  # Changed message type
-            '/amcl_pose',               # Changed topic name!
-            self.pose_callback,         # Renamed callback
-            qos
-        )
+        # self.odom_sub = self.create_subscription(
+        #     PoseWithCovarianceStamped,  # Changed message type
+        #     '/amcl_pose',               # Changed topic name!
+        #     self.pose_callback,         # Renamed callback
+        #     qos
+        # )
 
         self.ego_odom_sub = self.create_subscription(
             Odometry,
@@ -182,23 +182,21 @@ class MPCCNode(Node):
         return np.array(waypoints)
     
     def odom_callback(self, msg):
-        """Process /ego_racecar/odom for ground-truth body-frame velocity.
+        """Process /ego_racecar/odom for ground-truth state.
         
-        twist.linear.x is the F1TENTH simulator's integrated longitudinal
-        velocity — no differentiation, no filtering needed.
-        """
-        self.v_odom = msg.twist.twist.linear.x
-    
-
-    def pose_callback(self, msg):
-        """Process AMCL pose. Runs at ~33 Hz.
+        SOURCE OF TRUTH for (X, Y, φ, v) — sim publishes ground truth at ~50Hz
+        in the 'map' frame (verified — matches /amcl_pose within ~10cm).
         
-        Provides X, Y, φ only. Velocity comes from /ego_racecar/odom.
+        Uses ground-truth odom instead of /amcl_pose because AMCL exhibits
+        bursty position updates with 0.5-2.5m teleports during relocalization,
+        which destroys MPC tracking. AMCL kept subscribed but ignored — we can
+        re-enable it later for real-world deployment.
         """
+        # Position
         X = msg.pose.pose.position.x
         Y = msg.pose.pose.position.y
         
-        # Extract heading from quaternion
+        # Heading from quaternion (yaw only)
         qx = msg.pose.pose.orientation.x
         qy = msg.pose.pose.orientation.y
         qz = msg.pose.pose.orientation.z
@@ -206,33 +204,24 @@ class MPCCNode(Node):
         siny_cosp = 2.0 * (qw * qz + qx * qy)
         cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
         phi = np.arctan2(siny_cosp, cosy_cosp)
-
-        if not self.initialized:
-            self.initialized = True
-            self.theta = self.track.project_point(X, Y)
-            self.get_logger().info(
-                f'Initialized at θ={self.theta:.2f}m, pose=({X:.2f}, {Y:.2f})'
-            )
+        # print(f"Received odom: X={X:.3f}, Y={Y:.3f}, phi={np.rad2deg(phi):.1f} deg")
         
-            
-            # Store snapshot for control_loop (NOTE: do NOT write self.state here)
-            self._X = X
-            self._Y = Y
-            self._phi = phi
-            
-            # Initialize theta on first valid message
-            if not self.initialized:
-                self.initialized = True
-                self.theta = self.track.project_point(X, Y)
-                self.get_logger().info(
-                    f'Initialized at θ={self.theta:.2f}m, pose=({X:.2f}, {Y:.2f})'
-                )
+        # Velocity (body-frame longitudinal)
+        v = msg.twist.twist.linear.x
         
         # Store snapshot for control_loop
         self._X = X
         self._Y = Y
         self._phi = phi
+        self.v_odom = v
         
+        # Initialize theta on first message
+        if not self.initialized:
+            self.initialized = True
+            self.theta = self.track.project_point(X, Y)
+            self.get_logger().info(
+                f'Initialized from odom at θ={self.theta:.2f}m, pose=({X:.2f}, {Y:.2f})'
+            )
         
     
     def control_loop(self):
@@ -247,27 +236,48 @@ class MPCCNode(Node):
 
             X, Y, phi, v = self.state
             X_ref, Y_ref, Phi_ref = self.track.get_reference(self.theta)
+
+            # ===== DEBUG: Steering equation components =====
+            phi = self.state[2]
+            v = self.state[3]
+            L = self.vehicle.L
+
+            heading_error = np.arctan2(np.sin(phi - Phi_ref), np.cos(phi - Phi_ref))
+
+            print("[HEADING DEBUG]")
+            print(f"  phi - Phi_ref = {np.rad2deg(heading_error):.2f} deg")
+
+            approx_delta = (v / L) * self.controller.q_theta * heading_error
+
+            print("\n[STEERING DEBUG]")
+            print(f"  v                = {v:.4f}")
+            print(f"  phi              = {np.rad2deg(phi):.2f} deg")
+            print(f"  Phi_ref          = {np.rad2deg(Phi_ref):.2f} deg")
+            print(f"  heading error    = {np.rad2deg(heading_error):.2f} deg")
+            print(f"  q_theta          = {self.controller.q_theta:.2f}")
+            print(f"  approx delta     = {np.rad2deg(approx_delta):.2f} deg")
+
             e_c_now, e_l_now = self.track.compute_errors(X, Y, self.theta)
 
 
-            print(f"\n{'='*70}")
-            print(f"MPCC TICK  t={timestamp:.3f}s")
-            print(f"{'='*70}")
-            print(f"[INPUT TO SOLVER]")
-            print(f"  State x0:")
-            print(f"    X   = {X:+.4f} m")
-            print(f"    Y   = {Y:+.4f} m")
-            print(f"    phi = {np.rad2deg(phi):+.2f} deg")
-            print(f"    v   = {v:+.4f} m/s")
-            print(f"  Progress theta0 = {self.theta:.4f} m  (L = {self.track.L:.2f} m)")
-            print(f"  Reference at theta0:")
-            print(f"    X_ref   = {X_ref:+.4f} m")
-            print(f"    Y_ref   = {Y_ref:+.4f} m")
-            print(f"    Phi_ref = {np.rad2deg(Phi_ref):+.2f} deg")
-            print(f"  Errors at current state:")
-            print(f"    e_c (contouring) = {e_c_now:+.4f} m")
-            print(f"    e_l (lag)        = {e_l_now:+.4f} m")
-            print(f"    distance to ref  = {np.hypot(X-X_ref, Y-Y_ref):.4f} m")
+            # print(f"\n{'='*70}")
+            # print(f"MPCC TICK  t={timestamp:.3f}s")
+            # print(f"{'='*70}")
+            # print(f"[INPUT TO SOLVER]")
+            # print(f"  State x0:")
+            # print(f"    X   = {X:+.4f} m")
+            # print(f"    Y   = {Y:+.4f} m")
+            # print(f"    phi = {np.rad2deg(phi):+.2f} deg")
+            # print(f"    v   = {v:+.4f} m/s")
+            # print(f"  Progress theta0 = {self.theta:.4f} m  (L = {self.track.L:.2f} m)")
+            # print(f"  Reference at theta0:")
+            # print(f"    X_ref   = {X_ref:+.4f} m")
+            # print(f"    Y_ref   = {Y_ref:+.4f} m")
+            # print(f"    Phi_ref = {np.rad2deg(Phi_ref):+.2f} deg")
+            # print(f"  Errors at current state:")
+            # print(f"    e_c (contouring) = {e_c_now:+.4f} m")
+            # print(f"    e_l (lag)        = {e_l_now:+.4f} m")
+            # print(f"    distance to ref  = {np.hypot(X-X_ref, Y-Y_ref):.4f} m")
 
             
             # Solve MPCC
@@ -293,23 +303,29 @@ class MPCCNode(Node):
             delta = float(u_opt[0])  # Steering
             a = float(u_opt[1])      # Acceleration
 
-            print(f"[SOLVER OUTPUT]")
-            if hasattr(self.controller, 'last_result') and self.controller.last_result is not None:
-                info = self.controller.last_result.info
-                print(f"  Status:      {info.status}")
-                print(f"  Iterations:  {info.iter}")
-                print(f"  Solve time:  {info.solve_time*1000:.2f} ms")
-                print(f"  Objective:   {info.obj_val:.4f}")
-            print(f"  Control u[0]:")
-            print(f"    delta = {np.rad2deg(delta):+.2f} deg  "
-                  f"({delta:+.4f} rad)")
-            print(f"    a     = {a:+.3f} m/s^2")
-            if v_virtual_pred is not None and len(v_virtual_pred) > 0:
-                print(f"  Virtual velocity v_virt[0] = {v_virtual_pred[0]:+.4f} m/s")
-                print(f"  Virtual velocity trajectory: "
-                      f"min={v_virtual_pred.min():+.3f}, "
-                      f"max={v_virtual_pred.max():+.3f}, "
-                      f"mean={v_virtual_pred.mean():+.3f} m/s")
+            print("[CONTROL OUTPUT]")
+            print(f"  delta (actual)   = {np.rad2deg(delta):.2f} deg")
+            print(f"  acceleration     = {a:.3f}")
+            print("[VELOCITY DEBUG]")
+            
+
+            # print(f"[SOLVER OUTPUT]")
+            # if hasattr(self.controller, 'last_result') and self.controller.last_result is not None:
+            #     info = self.controller.last_result.info
+            #     print(f"  Status:      {info.status}")
+            #     print(f"  Iterations:  {info.iter}")
+            #     print(f"  Solve time:  {info.solve_time*1000:.2f} ms")
+            #     print(f"  Objective:   {info.obj_val:.4f}")
+            # print(f"  Control u[0]:")
+            # print(f"    delta = {np.rad2deg(delta):+.2f} deg  "
+            #       f"({delta:+.4f} rad)")
+            # print(f"    a     = {a:+.3f} m/s^2")
+            # if v_virtual_pred is not None and len(v_virtual_pred) > 0:
+            #     print(f"  Virtual velocity v_virt[0] = {v_virtual_pred[0]:+.4f} m/s")
+            #     print(f"  Virtual velocity trajectory: "
+            #           f"min={v_virtual_pred.min():+.3f}, "
+            #           f"max={v_virtual_pred.max():+.3f}, "
+            #           f"mean={v_virtual_pred.mean():+.3f} m/s")
 
             # ============================================================
             # PREDICTED TRAJECTORY (first 3 steps of horizon)
@@ -332,6 +348,9 @@ class MPCCNode(Node):
             v_current = self.state[3]
             v_target = v_current + a * self.controller.dt
             v_target = np.clip(v_target, 0.0, self.controller.v_max)
+
+            print(f"  v_current        = {v:.4f}")
+            print(f"  v_target         = {v_target:.4f}")
             
             # Clip steering
             delta = np.clip(delta, -self.controller.delta_max, self.controller.delta_max)
