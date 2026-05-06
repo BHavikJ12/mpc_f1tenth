@@ -1,14 +1,31 @@
-
 """
-ROS2 node for MPCC controller
+ROS2 node for MPCC controller — DriftingCar / DynamicBicycle2D backend.
+
+State convention (matches safe_control repo exactly):
+    [x, y, theta, r, beta, V, delta, tau]
+     0  1    2    3    4   5    6     7
+
+    x, y    — global position          [m]       — from odom pose
+    theta   — heading                  [rad]     — from odom quaternion
+    r       — yaw rate                 [rad/s]   — from odom twist.angular.z
+    beta    — side-slip angle          [rad]     — not in odom; held at 0
+    V       — speed magnitude          [m/s]     — from odom twist.linear.x
+    delta   — current steering angle   [rad]     — integrated from delta_dot output
+    tau     — current drive torque     [Nm]      — integrated from tau_dot output
+
+Control output from MPCC.solve_control_problem():
+    U = [delta_dot, tau_dot]           (2x1 numpy array)
+
+All error computation (e_c, e_l, e_theta, e_v) happens INSIDE the MPCC
+optimizer as CasADi symbolic expressions. The node never computes errors.
 
 Subscribes to:
-    /odom (nav_msgs/Odometry): Vehicle odometry
-    
+    /ego_racecar/odom  (nav_msgs/Odometry)
+
 Publishes to:
-    /drive (ackermann_msgs/AckermannDriveStamped): Control commands
-    /mpcc/predicted_path (nav_msgs/Path): Predicted trajectory
-    /mpcc/reference_path (nav_msgs/Path): Reference centerline
+    /drive                  (ackermann_msgs/AckermannDriveStamped)
+    /mpcc/predicted_path    (nav_msgs/Path)
+    /mpcc/reference_path    (nav_msgs/Path)
 """
 
 import rclpy
@@ -17,455 +34,445 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 import numpy as np
 import csv
-import pathlib 
-from geometry_msgs.msg import PoseWithCovarianceStamped
+import pathlib
+import traceback
+
 from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import PoseStamped
 from ackermann_msgs.msg import AckermannDriveStamped
-from visualization_msgs.msg import MarkerArray, Marker
-from std_msgs.msg import ColorRGBA
 
-from mpcc_controller.track_map import TrackMap
-from mpcc_controller.vehicle_model import VehicleModel
-from mpcc_controller.mpcc_controller import MPCCController
-from mpcc_controller.mpcc_logger import MPCCLogger
+from drifting_car import DriftingCar
+from mpcc import MPCC
+
 
 class MPCCNode(Node):
-    """ROS2 node for MPCC control"""
-    
+    """ROS2 node for MPCC using DriftingCar + DynamicBicycle2D dynamics."""
+
     def __init__(self):
         super().__init__('mpcc_controller')
 
-        # Pose snapshot (from AMCL)
-        self._X = None
-        self._Y = None
-        self._phi = None
+        # ── raw odom snapshots ─────────────────────────────────────────────
+        # Populated by odom_callback; consumed by control_loop each tick.
+        self._x:     float | None = None   # global x       [m]
+        self._y:     float | None = None   # global y       [m]
+        self._theta: float | None = None   # heading        [rad]
+        self._r:     float = 0.0           # yaw rate       [rad/s]  — odom angular.z
+        self._V:     float = 0.0           # speed          [m/s]    — odom linear.x
 
-        # Velocity snapshot (from odom — body-frame longitudinal)
-        self.v_odom = 0.0
-        
-        # Declare parameters
-        self.declare_parameter('waypoints_file', 'waypoints.csv')
-        self.declare_parameter('horizon_length', 10)
-        self.declare_parameter('dt', 0.05)
-        self.declare_parameter('wheelbase', 0.33)
-        self.declare_parameter('track_width', 1.0)
-        self.declare_parameter('control_frequency', 10.0)
-        self.declare_parameter('visualize', True)
-        
-        # Cost weights
-        self.declare_parameter('q_contour', 50.0)
-        self.declare_parameter('q_lag', 50.0)
-        self.declare_parameter('gamma', 100.0)
-        
-        # Vehicle constraints
-        self.declare_parameter('max_steering', np.deg2rad(60.0))  # 30 degrees in radians
-        self.declare_parameter('max_acceleration', 3.0)
-        self.declare_parameter('max_velocity', 8.0)
-        
-        # Get parameters
-        waypoints_file = self.get_parameter('waypoints_file').value
-        N = self.get_parameter('horizon_length').value
-        dt = self.get_parameter('dt').value
-        wheelbase = self.get_parameter('wheelbase').value
-        track_width = self.get_parameter('track_width').value
-        self.control_freq = self.get_parameter('control_frequency').value
-        self.visualize = self.get_parameter('visualize').value
-        
-        # Load waypoints
-        self.get_logger().info(f'Loading waypoints from: {waypoints_file}')
-        waypoints = self._load_waypoints(waypoints_file)
-        self.get_logger().info(f'Loaded {len(waypoints)} waypoints')
-        print(f"First waypoint: {waypoints[0]}")
-        print(f"Waypoint range X: [{waypoints[:,0].min():.3f}, {waypoints[:,0].max():.3f}]")
-        print(f"Waypoint range Y: [{waypoints[:,1].min():.3f}, {waypoints[:,1].max():.3f}]")
-                
-        # Initialize track and vehicle
-        self.track = TrackMap(waypoints, track_width)
-        print(f"🔍 TRACK LENGTH = {self.track.L:.3f} meters")  # ADD THIS!
-        self.vehicle = VehicleModel(wheelbase)
-        
-        # Initialize MPCC controller
-        self.controller = MPCCController(self.vehicle, self.track, N, dt)
-        
-        # Set cost weights from parameters
-        self.controller.q_c = self.get_parameter('q_contour').value
-        self.controller.q_l = self.get_parameter('q_lag').value
-        self.controller.gamma = self.get_parameter('gamma').value
-        
-        # Set constraints
-        self.controller.delta_max = self.get_parameter('max_steering').value
-        self.controller.a_max = self.get_parameter('max_acceleration').value
-        self.controller.v_max = self.get_parameter('max_velocity').value
-        
-        # State variables
-        self.state = None  # [X, Y, φ, v]
-        self.theta = None  # Current progress
+        # delta and tau are not observable from /odom.
+        # Integrated forward each tick from MPCC output [delta_dot, tau_dot].
+        self._delta_est: float = 0.0       # steering angle estimate  [rad]
+        self._tau_est:   float = 0.0       # torque estimate          [Nm]
+
+        # beta (side-slip) is not in /odom.
+        # Held at 0 — valid at moderate speeds on high-friction surface (mu=1.0).
+        self._beta: float = 0.0
+
         self.initialized = False
-        
-        # QoS profile
+
+        # ── declare parameters ─────────────────────────────────────────────
+        self.declare_parameter('waypoints_file', 'waypoints.csv')
+        self.declare_parameter('dt', 0.05)
+        self.declare_parameter('control_frequency', 1.0)
+        self.declare_parameter('horizon_length', 30)
+        self.declare_parameter('visualize', True)
+
+        # Vehicle geometry — key names match DynamicBicycle2D.__init__ robot_spec keys
+        self.declare_parameter('a', 1.4)               # front axle to CG      [m]
+        self.declare_parameter('b', 1.4)               # rear axle to CG       [m]
+        self.declare_parameter('wheel_base', 2.8)
+        self.declare_parameter('body_length', 4.5)
+        self.declare_parameter('body_width', 2.0)
+        self.declare_parameter('radius', 1.2)          # collision radius       [m]
+
+        # Mass / inertia
+        self.declare_parameter('m', 2500.0)            # vehicle mass           [kg]
+        self.declare_parameter('Iz', 5000.0)           # yaw moment of inertia  [kg*m^2]
+
+        # Tire parameters — Fiala brush model in DynamicBicycle2D
+        self.declare_parameter('Cc_f', 80000.0)        # front cornering stiff. [N/rad]
+        self.declare_parameter('Cc_r', 100000.0)       # rear cornering stiff.  [N/rad]
+        self.declare_parameter('mu', 1.0)              # friction coefficient
+        self.declare_parameter('r_w', 0.35)            # wheel radius           [m]
+        self.declare_parameter('gamma', 0.95)          # numeric stability param
+
+        # Input limits
+        self.declare_parameter('delta_max', np.deg2rad(20.0))     # [rad]
+        self.declare_parameter('delta_dot_max', np.deg2rad(25.0)) # [rad/s]
+        self.declare_parameter('tau_max', 4000.0)                 # [Nm]
+        self.declare_parameter('tau_dot_max', 8000.0)             # [Nm/s]
+
+        # State limits
+        self.declare_parameter('v_max', 1.0)
+        self.declare_parameter('v_min', 0.5)
+        self.declare_parameter('r_max', 2.0)
+        self.declare_parameter('beta_max', np.deg2rad(45.0))      # [rad]
+        self.declare_parameter('v_psi_max', 15.0)                 # max progress rate [m/s]
+
+        # MPCC cost weights — names match MPCC.set_cost_weights() keyword args exactly
+        self.declare_parameter('Q_c', 30.0)        # contouring error weight
+        self.declare_parameter('Q_l', 0.1)         # lag error weight
+        self.declare_parameter('Q_theta', 1500.0)  # heading error weight
+        self.declare_parameter('Q_v', 100.0)       # velocity tracking weight
+        self.declare_parameter('Q_r', 20.0)        # yaw rate penalty weight
+        self.declare_parameter('v_ref', 7.0)       # target speed             [m/s]
+        # R vector order: [delta_dot, tau_dot, v_psi] — matches MPCC.set_rterm order
+        self.declare_parameter('R_delta_dot', 50.0)
+        self.declare_parameter('R_tau_dot', 0.1)
+        self.declare_parameter('R_vpsi', 0.0)
+        self.declare_parameter('v_psi_ref', 7.0)  # desired progress rate    [m/s]
+
+        # ── read parameters ────────────────────────────────────────────────
+        waypoints_file    = self.get_parameter('waypoints_file').value
+        dt                = self.get_parameter('dt').value
+        self.control_freq = self.get_parameter('control_frequency').value
+        horizon           = self.get_parameter('horizon_length').value
+        self.visualize    = self.get_parameter('visualize').value
+        v_ref             = self.get_parameter('v_ref').value
+        v_psi_ref         = self.get_parameter('v_psi_ref').value
+
+        # robot_spec — key names match DynamicBicycle2D.__init__ setdefault() calls exactly
+        robot_spec = {
+            'a':             self.get_parameter('a').value,
+            'b':             self.get_parameter('b').value,
+            'wheel_base':    self.get_parameter('wheel_base').value,
+            'body_length':   self.get_parameter('body_length').value,
+            'body_width':    self.get_parameter('body_width').value,
+            'radius':        self.get_parameter('radius').value,
+            'm':             self.get_parameter('m').value,
+            'Iz':            self.get_parameter('Iz').value,
+            'Cc_f':          self.get_parameter('Cc_f').value,
+            'Cc_r':          self.get_parameter('Cc_r').value,
+            'mu':            self.get_parameter('mu').value,
+            'r_w':           self.get_parameter('r_w').value,
+            'gamma':         self.get_parameter('gamma').value,
+            'delta_max':     self.get_parameter('delta_max').value,
+            'delta_dot_max': self.get_parameter('delta_dot_max').value,
+            'tau_max':       self.get_parameter('tau_max').value,
+            'tau_dot_max':   self.get_parameter('tau_dot_max').value,
+            'v_max':         self.get_parameter('v_max').value,
+            'v_min':         self.get_parameter('v_min').value,
+            'r_max':         self.get_parameter('r_max').value,
+            'beta_max':      self.get_parameter('beta_max').value,
+            'v_psi_max':     self.get_parameter('v_psi_max').value,
+        }
+
+        # R weight vector: order must match MPCC._create_mpc() set_rterm(u=self.R)
+        # which applies to [delta_dot, tau_dot, v_psi] in that order
+        R = np.array([
+            self.get_parameter('R_delta_dot').value,
+            self.get_parameter('R_tau_dot').value,
+            self.get_parameter('R_vpsi').value,
+        ])
+
+        # ── load waypoints ─────────────────────────────────────────────────
+        self.get_logger().info(f'Loading waypoints from: {waypoints_file}')
+        path_x, path_y = self._load_waypoints(waypoints_file)
+        self.get_logger().info(f'Loaded {len(path_x)} waypoints')
+
+        # ── DriftingCar — ax=None suppresses all matplotlib code ───────────
+        # Placeholder initial state; car.X is overwritten from odom before first solve.
+        X0 = np.array([
+            path_x[0], path_y[0],  # x, y      [m]
+            0.0,                   # theta      [rad]  — overwritten from odom
+            0.0,                   # r          [rad/s]
+            0.0,                   # beta       [rad]
+            v_ref,                 # V          [m/s]  — start near target speed
+            0.0,                   # delta      [rad]
+            0.0,                   # tau        [Nm]
+        ])
+        self.car = DriftingCar(X0, robot_spec, dt, ax=None)
+        robot_spec['model'] = 'DriftingCar'
+
+        # ── MPCC ───────────────────────────────────────────────────────────
+        # MPCC.__init__ checks robot_spec['model'] == 'DriftingCar'
+        # DriftingCar.__init__ sets robot_spec['model'] = 'DriftingCar' automatically
+        self.mpcc = MPCC(self.car, robot_spec, show_mpc_traj=False, horizon=horizon)
+
+        self.mpcc.set_reference_path(path_x, path_y)
+
+        # set_cost_weights() rebuilds the entire MPC + simulator + estimator internally
+        self.mpcc.set_cost_weights(
+            Q_c=     self.get_parameter('Q_c').value,
+            Q_l=     self.get_parameter('Q_l').value,
+            Q_theta= self.get_parameter('Q_theta').value,
+            Q_v=     self.get_parameter('Q_v').value,
+            Q_r=     self.get_parameter('Q_r').value,
+            v_ref=   v_ref,
+            R=       R,
+        )
+        # set_progress_rate() sets self.v_psi_ref used inside the TVP lookahead function
+        self.mpcc.set_progress_rate(v_psi_ref)
+
+        # ── QoS ───────────────────────────────────────────────────────────
         qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
-            depth=10
+            depth=10,
         )
-        
-        # Subscribers
-        # self.odom_sub = self.create_subscription(
-        #     PoseWithCovarianceStamped,  # Changed message type
-        #     '/amcl_pose',               # Changed topic name!
-        #     self.pose_callback,         # Renamed callback
-        #     qos
-        # )
 
-        self.ego_odom_sub = self.create_subscription(
-            Odometry,
-            '/ego_racecar/odom',
-            self.odom_callback,
-            qos
-        )
-        
-        # Publishers
-        self.drive_pub = self.create_publisher(
-            AckermannDriveStamped,
-            '/drive',
-            qos
-        )
-        
+        # ── subscribers ───────────────────────────────────────────────────
+        self.create_subscription(Odometry, '/ego_racecar/odom', self.odom_callback, qos)
+
+        # ── publishers ────────────────────────────────────────────────────
+        self.drive_pub = self.create_publisher(AckermannDriveStamped, '/drive', qos)
+
         if self.visualize:
             self.pred_path_pub = self.create_publisher(Path, '/mpcc/predicted_path', qos)
-            self.ref_path_pub = self.create_publisher(Path, '/mpcc/reference_path', qos)
-            self.markers_pub = self.create_publisher(MarkerArray, '/mpcc/diagnostics', qos)
-        
-        self.timer = self.create_timer(1.0 / self.control_freq, self.control_loop)
-                
-        self.get_logger().info('MPCC Controller initialized')
-        self.get_logger().info(f'Control frequency: {self.control_freq} Hz')
-        self.get_logger().info(f'Horizon: {N} steps, dt: {dt}s')
+            self.ref_path_pub  = self.create_publisher(Path, '/mpcc/reference_path',  qos)
 
-        self.create_timer(0.1, self._check_shutdown)
+        # ── control timer ─────────────────────────────────────────────────
+        self.create_timer(1.0 / self.control_freq, self.control_loop)
 
-        log_dir = pathlib.Path.home() / 'mpcc_logs'  # Or any directory you prefer
-        self.logger = MPCCLogger(log_dir=str(log_dir), enable=True)
-        self.get_logger().info(f'CSV Logger initialized: {log_dir}')
+        self.get_logger().info('MPCC node ready')
+        self.get_logger().info(
+            f'Control: {self.control_freq} Hz | dt={dt} s | horizon={horizon} steps'
+        )
 
-    def _check_shutdown(self):
-        """Periodic check for shutdown - ensures logger cleanup"""
-        # This will be called periodically, no action needed
-        # The logger's atexit handler will clean up automatically
-        pass
-    
-    def destroy_node(self):
-        """Override destroy to ensure logger cleanup"""
-        if hasattr(self, 'logger'):
-            self.logger.close()
-        super().destroy_node()
-    
-    def _load_waypoints(self, filepath):
-        """Load waypoints from CSV file"""
-        waypoints = []
-        # Try to find file
-        if not pathlib.Path(filepath).exists():
-            # Try in package share directory
+    # ── waypoint loader ────────────────────────────────────────────────────
+
+    def _load_waypoints(self, filepath: str):
+        """Load x_m, y_m columns from CSV. Returns (path_x, path_y) numpy arrays."""
+        p = pathlib.Path(filepath)
+        if not p.exists():
             from ament_index_python.packages import get_package_share_directory
             pkg_dir = get_package_share_directory('mpcc_controller')
-            filepath = pathlib.Path(pkg_dir) / 'config' / filepath
-        
-        with open(filepath, 'r') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                x = float(row['x_m'])
-                y = float(row['y_m'])
-                waypoints.append([x, y])
+            p = pathlib.Path(pkg_dir) / 'config' / filepath
 
-        waypoints = list(reversed(waypoints))
-        return np.array(waypoints)
-    
-    def odom_callback(self, msg):
-        """Process /ego_racecar/odom for ground-truth state.
-        
-        SOURCE OF TRUTH for (X, Y, φ, v) — sim publishes ground truth at ~50Hz
-        in the 'map' frame (verified — matches /amcl_pose within ~10cm).
-        
-        Uses ground-truth odom instead of /amcl_pose because AMCL exhibits
-        bursty position updates with 0.5-2.5m teleports during relocalization,
-        which destroys MPC tracking. AMCL kept subscribed but ignored — we can
-        re-enable it later for real-world deployment.
+        rows = []
+        with open(p, 'r') as f:
+            for row in csv.DictReader(f):
+                rows.append([float(row['x_m']), float(row['y_m'])])
+
+        rows = list(reversed(rows))   # same direction convention as old node
+        arr  = np.array(rows)
+        return arr[:, 0], arr[:, 1]
+
+    # ── odom callback ──────────────────────────────────────────────────────
+
+    def odom_callback(self, msg: Odometry):
         """
-        # Position
-        X = msg.pose.pose.position.x
-        Y = msg.pose.pose.position.y
-        
-        # Heading from quaternion (yaw only)
+        Cache observable states from /ego_racecar/odom.
+
+        Directly observable:
+            x, y   — msg.pose.pose.position.x/y
+            theta  — yaw from quaternion
+            V      — msg.twist.twist.linear.x     (body-frame longitudinal speed)
+            r      — msg.twist.twist.angular.z    (yaw rate, available in odom)
+
+        Not in /odom (handled in control_loop):
+            beta   — held at 0
+            delta  — integrated from delta_dot
+            tau    — integrated from tau_dot
+        """
+        self._x = msg.pose.pose.position.x
+        self._y = msg.pose.pose.position.y
+
+        # Quaternion → yaw (theta)
         qx = msg.pose.pose.orientation.x
         qy = msg.pose.pose.orientation.y
         qz = msg.pose.pose.orientation.z
         qw = msg.pose.pose.orientation.w
         siny_cosp = 2.0 * (qw * qz + qx * qy)
         cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
-        phi = np.arctan2(siny_cosp, cosy_cosp)
-        # print(f"Received odom: X={X:.3f}, Y={Y:.3f}, phi={np.rad2deg(phi):.1f} deg")
-        
-        # Velocity (body-frame longitudinal)
-        v = msg.twist.twist.linear.x
-        
-        # Store snapshot for control_loop
-        self._X = X
-        self._Y = Y
-        self._phi = phi
-        self.v_odom = v
-        
-        # Initialize theta on first message
+        self._theta = np.arctan2(siny_cosp, cosy_cosp)
+
+        # Yaw rate — directly from odom, unused in old node
+        self._r = msg.twist.twist.angular.z
+
+        vx = msg.twist.twist.linear.x
+        vy = msg.twist.twist.linear.y
+        self._V = np.sqrt(vx**2 + vy**2)  # true speed magnitude
+        self._beta = np.arctan2(vy, vx) if np.sqrt(vx**2 + vy**2) > 0.5 else self._beta
+
+        self.get_logger().info(
+                f'odom: '
+                f'x={self._x:.2f} m  y={self._y:.2f} m  '
+                f'theta={np.rad2deg(self._theta):.1f} deg  '
+                f'V={self._V:.2f} m/s  r={self._r:.3f} rad/s'
+                f'beta={np.rad2deg(self._beta):.1f} deg'
+            )
         if not self.initialized:
             self.initialized = True
-            self.theta = self.track.project_point(X, Y)
             self.get_logger().info(
-                f'Initialized from odom at θ={self.theta:.2f}m, pose=({X:.2f}, {Y:.2f})'
+                f'First odom: '
+                f'x={self._x:.2f} m  y={self._y:.2f} m  '
+                f'theta={np.rad2deg(self._theta):.1f} deg  '
+                f'V={self._V:.2f} m/s  r={self._r:.3f} rad/s'
+                f'beta={np.rad2deg(self._beta):.1f} deg'
             )
-        
-    
+
+    # ── control loop ───────────────────────────────────────────────────────
+
     def control_loop(self):
-        """Main control loop (called at control_frequency)"""   
-        if not self.initialized or self._X is None:
+        """
+        Main control loop at control_frequency Hz.
+
+        Steps:
+          1. Assemble 8-state vector from odom snapshots + running estimates.
+          2. Inject into car.X  — NOT calling car.step(); the sim owns dynamics.
+          3. Call mpcc.solve_control_problem(state) → U = [delta_dot, tau_dot].
+          4. Integrate _delta_est and _tau_est forward by car.dt.
+          5. Derive v_target from _tau_est and publish AckermannDriveStamped.
+          6. Optionally publish predicted/reference paths for RViz.
+
+        Error computation (e_c, e_l, e_theta, e_v) is entirely inside
+        MPCC._create_model() as CasADi symbolic expressions baked into the
+        optimizer. This node never computes errors explicitly.
+        """
+        if not self.initialized or self._x is None:
             return
-    
-        self.state = np.array([self._X, self._Y, self._phi, self.v_odom])
-        
+
         try:
-            timestamp = self.get_clock().now().nanoseconds / 1e9
+            # ── 1. assemble full 8-state vector ───────────────────────────
+            # Index mapping from DriftingCar (drifting_car.py line 50):
+            #   X[0]=x  X[1]=y  X[2]=theta  X[3]=r  X[4]=beta  X[5]=V  X[6]=delta  X[7]=tau
+            state = np.array([
+                self._x,           # X[0]  x       [m]      — odom position
+                self._y,           # X[1]  y       [m]      — odom position
+                self._theta,       # X[2]  theta   [rad]    — odom quaternion
+                self._r,           # X[3]  r       [rad/s]  — odom angular.z
+                self._beta,        # X[4]  beta    [rad]    — held 0
+                self._V,           # X[5]  V       [m/s]    — odom linear.x
+                self._delta_est,   # X[6]  delta   [rad]    — integrated estimate
+                self._tau_est,     # X[7]  tau     [Nm]     — integrated estimate
+            ])
 
-            X, Y, phi, v = self.state
-            X_ref, Y_ref, Phi_ref = self.track.get_reference(self.theta)
+            # ── 2. inject real state into DriftingCar ─────────────────────
+            # car.X is read by MPCC.solve_control_problem() via robot.get_state().
+            # Writing directly bypasses car.step() — correct for real/sim deployment.
+            self.car.X = state.reshape(-1, 1)
 
-            # ===== DEBUG: Steering equation components =====
-            phi = self.state[2]
-            v = self.state[3]
-            L = self.vehicle.L
+            # ── 3. solve ───────────────────────────────────────────────────
+            # Internally: finds closest path point (_find_closest_path_point),
+            # builds TVP reference over horizon (_set_tvp), runs IPOPT,
+            # stores predictions (_store_predictions), steps do-mpc simulator.
+            # Returns U[:2] — [delta_dot [rad/s], tau_dot [Nm/s]] as (2,1).
+            U = self.mpcc.solve_control_problem(self.car.get_state())
 
-            heading_error = np.arctan2(np.sin(phi - Phi_ref), np.cos(phi - Phi_ref))
+            delta_dot = float(U[0, 0])   # [rad/s]
+            tau_dot   = float(U[1, 0])   # [Nm/s]
 
-            print("[HEADING DEBUG]")
-            print(f"  phi - Phi_ref = {np.rad2deg(heading_error):.2f} deg")
+            # ── 4. integrate echo states ───────────────────────────────────
+            # delta and tau are rate-controlled in the DynamicBicycle2D model:
+            #   delta_next = delta + delta_dot * dt
+            #   tau_next   = tau   + tau_dot   * dt
+            # We mirror that integration here so the next tick's state is consistent.
+            dt = self.car.dt
+            self._delta_est = float(np.clip(
+                self._delta_est + delta_dot * dt,
+                -self.car.robot_spec['delta_max'],
+                 self.car.robot_spec['delta_max'],
+            ))
+            self._tau_est = float(np.clip(
+                self._tau_est + tau_dot * dt,
+                -self.car.robot_spec['tau_max'],
+                 self.car.robot_spec['tau_max'],
+            ))
 
-            approx_delta = (v / L) * self.controller.q_theta * heading_error
+            # ── 5. publish AckermannDriveStamped ──────────────────────────
+            # steering_angle: absolute integrated delta_est [rad].
+            # speed: use mpcc.v_ref directly — the MPCC already regulates
+            #   velocity to v_ref via the e_v = V - v_ref cost term.
+            #   Sending v_ref as the speed setpoint is consistent with what
+            #   the optimizer assumes the vehicle should be doing.
+            #   Clipped to [v_min, v_max] from robot_spec as a safety guard.
+            v_target = float(np.clip(
+                self.mpcc.v_ref,
+                self.car.robot_spec['v_min'],
+                self.car.robot_spec['v_max'],
+            ))
 
-            print("\n[STEERING DEBUG]")
-            print(f"  v                = {v:.4f}")
-            print(f"  phi              = {np.rad2deg(phi):.2f} deg")
-            print(f"  Phi_ref          = {np.rad2deg(Phi_ref):.2f} deg")
-            print(f"  heading error    = {np.rad2deg(heading_error):.2f} deg")
-            print(f"  q_theta          = {self.controller.q_theta:.2f}")
-            print(f"  approx delta     = {np.rad2deg(approx_delta):.2f} deg")
-
-            e_c_now, e_l_now = self.track.compute_errors(X, Y, self.theta)
-
-
-            # print(f"\n{'='*70}")
-            # print(f"MPCC TICK  t={timestamp:.3f}s")
-            # print(f"{'='*70}")
-            # print(f"[INPUT TO SOLVER]")
-            # print(f"  State x0:")
-            # print(f"    X   = {X:+.4f} m")
-            # print(f"    Y   = {Y:+.4f} m")
-            # print(f"    phi = {np.rad2deg(phi):+.2f} deg")
-            # print(f"    v   = {v:+.4f} m/s")
-            # print(f"  Progress theta0 = {self.theta:.4f} m  (L = {self.track.L:.2f} m)")
-            # print(f"  Reference at theta0:")
-            # print(f"    X_ref   = {X_ref:+.4f} m")
-            # print(f"    Y_ref   = {Y_ref:+.4f} m")
-            # print(f"    Phi_ref = {np.rad2deg(Phi_ref):+.2f} deg")
-            # print(f"  Errors at current state:")
-            # print(f"    e_c (contouring) = {e_c_now:+.4f} m")
-            # print(f"    e_l (lag)        = {e_l_now:+.4f} m")
-            # print(f"    distance to ref  = {np.hypot(X-X_ref, Y-Y_ref):.4f} m")
-
-            
-            # Solve MPCC
-            u_opt, x_pred, theta_pred = self.controller.solve(self.state, self.theta)
-
-            v_virtual_pred = getattr(self.controller, 'v_virtual_prev', None)
-        
-            # Log iteration to CSV
-            self.logger.log_iteration(
-                timestamp=timestamp,
-                state=self.state,
-                theta=self.theta,
-                u_opt=u_opt,
-                x_pred=x_pred,
-                theta_pred=theta_pred,
-                solver_result=self.controller.last_result,
-                track=self.track,
-                controller=self.controller,
-                v_virtual_pred=v_virtual_pred
-            )
-                
-            # Extract control
-            delta = float(u_opt[0])  # Steering
-            a = float(u_opt[1])      # Acceleration
-
-            print("[CONTROL OUTPUT]")
-            print(f"  delta (actual)   = {np.rad2deg(delta):.2f} deg")
-            print(f"  acceleration     = {a:.3f}")
-            print("[VELOCITY DEBUG]")
-            
-
-            # print(f"[SOLVER OUTPUT]")
-            # if hasattr(self.controller, 'last_result') and self.controller.last_result is not None:
-            #     info = self.controller.last_result.info
-            #     print(f"  Status:      {info.status}")
-            #     print(f"  Iterations:  {info.iter}")
-            #     print(f"  Solve time:  {info.solve_time*1000:.2f} ms")
-            #     print(f"  Objective:   {info.obj_val:.4f}")
-            # print(f"  Control u[0]:")
-            # print(f"    delta = {np.rad2deg(delta):+.2f} deg  "
-            #       f"({delta:+.4f} rad)")
-            # print(f"    a     = {a:+.3f} m/s^2")
-            # if v_virtual_pred is not None and len(v_virtual_pred) > 0:
-            #     print(f"  Virtual velocity v_virt[0] = {v_virtual_pred[0]:+.4f} m/s")
-            #     print(f"  Virtual velocity trajectory: "
-            #           f"min={v_virtual_pred.min():+.3f}, "
-            #           f"max={v_virtual_pred.max():+.3f}, "
-            #           f"mean={v_virtual_pred.mean():+.3f} m/s")
-
-            # ============================================================
-            # PREDICTED TRAJECTORY (first 3 steps of horizon)
-            # ============================================================
-            # print(f"[PREDICTED TRAJECTORY]")
-            # n_show = min(3, len(x_pred))
-            # for k in range(n_show):
-            #     print(f"  Step {k+1}: "
-            #           f"X={x_pred[k,0]:+.4f}, "
-            #           f"Y={x_pred[k,1]:+.4f}, "
-            #           f"phi={np.rad2deg(x_pred[k,2]):+.2f}deg, "
-            #           f"v={x_pred[k,3]:+.4f}m/s, "
-            #           f"theta={theta_pred[k]:.4f}m")
-            # print(f"  Horizon progress: "
-            #       f"delta_theta = {theta_pred[-1]-self.theta:+.4f} m "
-            #       f"over {len(theta_pred)} steps")
-            # print(f"{'='*70}\n")
-            
-            # Convert acceleration to target velocity
-            v_current = self.state[3]
-            v_target = v_current + a * self.controller.dt
-            v_target = np.clip(v_target, 0.0, self.controller.v_max)
-
-            print(f"  v_current        = {v:.4f}")
-            print(f"  v_target         = {v_target:.4f}")
-            
-            # Clip steering
-            delta = np.clip(delta, -self.controller.delta_max, self.controller.delta_max)
-            
-            # Publish drive command
             drive_msg = AckermannDriveStamped()
-            drive_msg.header.stamp = self.get_clock().now().to_msg()
+            drive_msg.header.stamp    = self.get_clock().now().to_msg()
             drive_msg.header.frame_id = 'base_link'
-            drive_msg.drive.steering_angle = delta
-            drive_msg.drive.speed = v_target
+            drive_msg.drive.steering_angle = self._delta_est   # [rad]
+            drive_msg.drive.speed          = v_target           # [m/s]
             self.drive_pub.publish(drive_msg)
-            
-            # Update theta for next iteration (use prediction)
-            # In pose_callback(), CHANGE line 243 to:
-            theta_predicted = float(theta_pred[0])
 
-            # Secondary source: projection of current pose, used only as
-            # a drift correction with a small gain.
-            theta_measured = self.track.project_point(self.state[0], self.state[1])
-
-            # Wrap-aware error: shortest signed distance on the circular
-            # track, in the range (-L/2, +L/2].
-            L = self.track.L
-            theta_error = (theta_measured - theta_predicted + L / 2.0) % L - L / 2.0
-
-            # correction_gain = 0.05
-            # self.theta = (theta_predicted + correction_gain * theta_error) % L
-            self.theta = self.track.project_point(self.state[0], self.state[1])
-            
-            # Compute errors for logging
-            e_c, e_l = self.track.compute_errors(
-                self.state[0], self.state[1], self.theta
+            self.get_logger().info(
+                f'x={self._x:.2f} y={self._y:.2f}  '
+                f'V={self._V:.2f} m/s  '
+                f'delta={np.rad2deg(self._delta_est):.1f} deg  '
+                f'v_target={v_target:.2f} m/s  '
+                f'solver={self.mpcc.status}',
+                throttle_duration_sec=1.0,
             )
-            
-            # Log
-            # self.get_logger().info(
-            #     f'θ={self.theta:.2f}m, v={v_current:.2f}m/s, '
-            #     f'δ={np.rad2deg(delta):.1f}°, a={a:.2f}m/s², '
-            #     f'e_c={e_c:.3f}m, e_l={e_l:.3f}m',
-            #     throttle_duration_sec=1.0
-            # )
-            
-            # Visualization
-            if self.visualize:
-                self._publish_visualization(x_pred, theta_pred)
-                
-        except Exception as e:
-            import traceback
-            self.get_logger().error(f'Control loop error: {e}')
-            self.get_logger().error(f'Traceback:\n{traceback.format_exc()}')
-    
-    def _publish_visualization(self, x_pred, theta_pred):
-        """Publish visualization markers"""
-        stamp = self.get_clock().now().to_msg()
-        
-        # Predicted path
-        pred_path = Path()
-        pred_path.header.stamp = stamp
-        pred_path.header.frame_id = 'map'
-        
-        for x in x_pred:
-            pose = PoseStamped()
-            pose.header = pred_path.header
-            pose.pose.position.x = x[0]
-            pose.pose.position.y = x[1]
-            pred_path.poses.append(pose)
-        
-        self.pred_path_pub.publish(pred_path)
-        
-        # Reference path
-        ref_path = Path()
-        ref_path.header = pred_path.header
-        
-        for theta in theta_pred:
-            X_ref, Y_ref, _ = self.track.get_reference(theta)
-            pose = PoseStamped()
-            pose.header = ref_path.header
-            pose.pose.position.x = X_ref
-            pose.pose.position.y = Y_ref
-            ref_path.poses.append(pose)
-        
-        self.ref_path_pub.publish(ref_path)
 
-    def __del__(self):
-        """Destructor - close logger on shutdown"""
-        if hasattr(self, 'logger'):
-            self.logger.close()
+            # ── 6. visualization ───────────────────────────────────────────
+            if self.visualize:
+                self._publish_visualization()
+
+        except Exception as e:
+            self.get_logger().error(f'Control loop error: {e}')
+            self.get_logger().error(traceback.format_exc())
+
+    # ── visualization ──────────────────────────────────────────────────────
+
+    def _publish_visualization(self):
+        """
+        Publish MPC predicted trajectory and reference lookahead as nav_msgs/Path.
+
+        mpcc.get_predictions()       — returns (predicted_states, predicted_inputs)
+                                       predicted_states shape: (2, horizon+1) — x,y only
+                                       stored in mpcc.predicted_states by _store_predictions()
+
+        mpcc.get_reference_horizon() — returns reference_horizon shape: (2, horizon+1)
+                                       stored in mpcc.reference_horizon by _set_tvp()
+        """
+        stamp = self.get_clock().now().to_msg()
+
+        pred_states, _ = self.mpcc.get_predictions()
+        if pred_states is not None:
+            pred_path = Path()
+            pred_path.header.stamp    = stamp
+            pred_path.header.frame_id = 'map'
+            for i in range(pred_states.shape[1]):
+                pose = PoseStamped()
+                pose.header = pred_path.header
+                pose.pose.position.x = float(pred_states[0, i])
+                pose.pose.position.y = float(pred_states[1, i])
+                pred_path.poses.append(pose)
+            self.pred_path_pub.publish(pred_path)
+
+        ref_horizon = self.mpcc.get_reference_horizon()
+        if ref_horizon is not None:
+            ref_path = Path()
+            ref_path.header.stamp    = stamp
+            ref_path.header.frame_id = 'map'
+            for i in range(ref_horizon.shape[1]):
+                pose = PoseStamped()
+                pose.header = ref_path.header
+                pose.pose.position.x = float(ref_horizon[0, i])
+                pose.pose.position.y = float(ref_horizon[1, i])
+                ref_path.poses.append(pose)
+            self.ref_path_pub.publish(ref_path)
+
+    # ── cleanup ────────────────────────────────────────────────────────────
+
+    def destroy_node(self):
+        super().destroy_node()
 
 
 def main(args=None):
     rclpy.init(args=args)
-    
     node = MPCCNode()
-    
+
     executor = rclpy.executors.MultiThreadedExecutor()
     executor.add_node(node)
-    
+
     try:
         executor.spin()
     except KeyboardInterrupt:
-        print("⚠️ Keyboard interrupt")
+        print('Keyboard interrupt — shutting down')
     except Exception as e:
-        print(f"❌ Executor error: {e}")
-        import traceback
+        print(f'Executor error: {e}')
         traceback.print_exc()
     finally:
-        print("🛑 Cleaning up...")
-        if hasattr(node, 'logger'):
-            node.logger.close()
-        print("🛑 Shutting down...")
         executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
-        print("✅ Shutdown complete")
-
+        print('Shutdown complete')
 
 
 if __name__ == '__main__':
